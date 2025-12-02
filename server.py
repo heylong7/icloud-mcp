@@ -241,7 +241,8 @@ if not DR_ONLY:
         start: str,
         end: str,
         tzid: Optional[str] = None,
-        description: Optional[str] = None
+        description: Optional[str] = None,
+        location: Optional[str] = None,
     ) -> str:
         """
         Create an event in the given calendar.
@@ -255,7 +256,7 @@ if not DR_ONLY:
         cal = _resolve_calendar(calendar_name_or_url)
 
         uid = os.urandom(16).hex() + "@chatgpt-mcp"
-        ics = [
+        ics_parts = [
             "BEGIN:VCALENDAR",
             "VERSION:2.0",
             "PRODID:-//ChatGPT MCP iCloud CalDAV//EN",
@@ -265,11 +266,13 @@ if not DR_ONLY:
             f"DTSTART;TZID={tzid}:{_fmt(s)}",
             f"DTEND;TZID={tzid}:{_fmt(e)}",
         ]
+        if location:  # empty string => no LOCATION line on create
+            ics_parts.append(f"LOCATION:{_ics_escape(location)}")
         if description:
-            ics.append(f"DESCRIPTION:{_ics_escape(description)}")
-        ics += ["END:VEVENT", "END:VCALENDAR"]
+            ics_parts.append(f"DESCRIPTION:{_ics_escape(description)}")
+        ics_parts += ["END:VEVENT", "END:VCALENDAR"]
 
-        cal.save_event("\n".join(ics))
+        cal.save_event("\n".join(ics_parts))
         return uid
 
     @mcp.tool()
