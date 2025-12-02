@@ -9,7 +9,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
-ENV HOST=0.0.0.0 PORT=8000
+# Runtime configuration (overridable via docker run -e ...)
+ENV HOST=0.0.0.0 \
+    PORT=8000 \
+    TZID=America/New_York \
+    DR_PROFILE=0 \
+    SCAN_DAYS=1095
 EXPOSE 8000
 
 CMD ["python", "server.py"]

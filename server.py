@@ -280,12 +280,35 @@ if not DR_ONLY:
         start: Optional[str] = None,   # ISO datetime, local or '...Z'
         end: Optional[str] = None,     # ISO datetime, local or '...Z'
         tzid: Optional[str] = None,    # IANA TZ; defaults to DEFAULT_TZID if not derivable
-        description: Optional[str] = None
+        description: Optional[str] = None,
+        location: Optional[str] = None,
     ) -> bool:
         """
         Update a single VEVENT identified by UID in the given calendar.
-        Any omitted field is preserved from the existing event.
-        Returns True if an event was updated, else False.
+
+        Parameters
+        ----------
+        calendar_name_or_url: str
+            Either the display name or absolute CalDAV URL of the calendar containing the event.
+        uid: str
+            The unique identifier of the event to update.
+        summary: Optional[str]
+            New event summary. If not provided, the existing summary is preserved.
+        start: Optional[str]
+            New start datetime in ISO format. If not provided, the existing start is preserved.
+        end: Optional[str]
+            New end datetime in ISO format. If not provided, the existing end is preserved.
+        tzid: Optional[str]
+            Time zone identifier. If omitted, defaults to the original event's TZID or DEFAULT_TZID.
+        description: Optional[str]
+            New event description. If not provided, the existing description is preserved.
+        location: Optional[str]
+            New event location. If not provided, the existing location is preserved. To clear the
+            location, pass an empty string.
+
+        Returns:
+        bool
+            True if an event was updated, else False (if the UID was not found).
 
         Notes:
         - Updates the whole event (series, if recurring), not a single instance.
@@ -311,6 +334,7 @@ if not DR_ONLY:
         comp = target.component
         old_summary = str(comp.get("summary", "")) if comp.get("summary") is not None else ""
         old_desc    = str(comp.get("description", "")) if comp.get("description") is not None else ""
+        old_loc     = str(comp.get("location", "")) if comp.get("location") is not None else ""
         old_dtstart = comp.decoded("dtstart")
         old_dtend   = comp.decoded("dtend", default=None)
 
@@ -323,6 +347,7 @@ if not DR_ONLY:
 
         new_summary = summary if summary is not None else old_summary
         new_desc    = description if description is not None else old_desc
+        new_loc     = location if location is not None else old_loc
         new_start   = _to_dt(start, old_dtstart)
         new_end     = _to_dt(end,   old_dtend if old_dtend is not None else (new_start + dt.timedelta(hours=1)))
 
@@ -333,6 +358,8 @@ if not DR_ONLY:
             orig_tzid = None
         use_tzid = tzid or orig_tzid or DEFAULT_TZID
 
+        # Build a minimal VEVENT. Include LOCATION only when non-empty so callers can clear
+        # it by passing an empty string. All text fields are escaped according to RFC 5545.
         new_ics = "\n".join([
             "BEGIN:VCALENDAR",
             "VERSION:2.0",
@@ -342,6 +369,7 @@ if not DR_ONLY:
             f"SUMMARY:{_ics_escape(new_summary)}",
             f"DTSTART;TZID={use_tzid}:{_fmt(new_start)}",
             f"DTEND;TZID={use_tzid}:{_fmt(new_end)}",
+            *( [f"LOCATION:{_ics_escape(new_loc)}"] if new_loc is not None and new_loc != "" else [] ),
             *( [f"DESCRIPTION:{_ics_escape(new_desc)}"] if new_desc else [] ),
             "END:VEVENT",
             "END:VCALENDAR",

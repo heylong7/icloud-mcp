@@ -18,8 +18,8 @@ I built this to use in ChatGPT Custom Connector, so I can change my iCloud Calen
 - Tools:
   - `list_calendars()`
   - `list_events(calendar_name_or_url, start, end, expand_recurring=True)`
-  - `create_event(calendar_name_or_url, summary, start, end, tzid?, description?)`
-  - `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?)`
+  - `create_event(calendar_name_or_url, summary, start, end, tzid?, description?, location?)`
+  - `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?)`
   - `delete_event(calendar_name_or_url, uid)`
 - ISO datetime input (`YYYY-MM-DDTHH:MM:SS`, with optional `Z` or timezone offset)
 - Minimal ICS generation (summary/description escaping), UID matching across a ±3-year window
@@ -99,18 +99,24 @@ Returns:
 * `end: str | null` (ISO)
 * `raw: str` (original ICS text)
 
-### `create_event(calendar_name_or_url, summary, start, end, tzid?, description?) -> str`
+### `create_event(calendar_name_or_url, summary, start, end, tzid?, description?, location?) -> str`
 
 Creates a minimal **VEVENT**.
 
 * `tzid` defaults to `TZID` env if omitted.
+* `description` is optional; omit or pass `null` to skip it.
+* `location` is optional; omit or pass `null` to skip it.
 * Returns the generated `uid` (random hex + `@chatgpt-mcp`).
 
-### `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?) -> bool`
+### `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?) -> bool`
 
 Updates the **whole** event identified by `uid` (for recurring events this updates the series VEVENT, not a single instance).
 
 * Preserves any omitted fields from the original component.
+* `location`:
+  * If omitted (`null` / not provided), keeps the existing location.
+  * If provided as a non-empty string, updates the event’s location.
+  * If provided as an empty string, clears the event’s location.
 * Returns `True` on success, `False` if `uid` not found in ±3-year window.
 
 ### `delete_event(calendar_name_or_url, uid) -> bool`
@@ -124,6 +130,7 @@ Deletes the first matching `uid` in a ±3-year window.
 * Accepts naive or `Z`/offset datetimes (`YYYY-MM-DDTHH:MM:SS`, optionally `Z` or `-04:00` etc.)
 * New/edited events emit `DTSTART;TZID=...` and `DTEND;TZID=...` using provided `tzid` or `TZID` env
 * Updates attempt to reuse the original TZID when present
+* `LOCATION` is emitted when `location` is provided and non-empty; passing an empty string when updating an event removes the existing location.
 
 ---
 
@@ -162,7 +169,7 @@ def unwrap(res):
 
 async def main():
     async with Client(MCP_URL) as c:
-        cals = unwrap(await c.call_tool("list_calendars"))
+        cals = unwrap(await c.call_tool("list_calendars", {"confirm": True}))
         print("Calendars:", cals[:2])
 
         evs = unwrap(await c.call_tool("list_events", {
@@ -178,7 +185,8 @@ async def main():
             "summary":"Demo",
             "start":"2025-09-29T15:00:00",
             "end":"2025-09-29T15:30:00",
-            "tzid":"America/New_York"
+            "tzid":"America/New_York",
+            "location": "Bobst Library"
         }))
         print("Created:", uid)
 

@@ -1,5 +1,12 @@
 # Deployment / Public HTTPS
 
+The MCP server listens on `HOST:PORT` (default `0.0.0.0:8000`) and serves:
+
+- MCP JSON-RPC: `POST /mcp`
+- Health check: `GET /health`
+
+> Keep this private or fronted by auth; it has write access to your iCloud Calendar.
+
 ## Cloudflare Tunnel
 
 Prereq: a domain on Cloudflare.
@@ -29,7 +36,8 @@ YAML
 cloudflared tunnel run icloud-mcp
 ```
 
-MCP URL: `https://mcp.yourdomain.com/mcp`
+MCP URL: `https://mcp.yourdomain.com/mcp`  
+Health: `https://mcp.yourdomain.com/health`
 
 ## ngrok
 
@@ -39,8 +47,12 @@ ngrok config add-authtoken <YOUR_TOKEN>
 ngrok http 8000
 ```
 
-Use the printed https URL: `https://<random>.ngrok.io/mcp`
-> Note: free ngrok URLs rotates.
+Use the printed https URL:
+
+- MCP: `https://<random>.ngrok.io/mcp`
+- Health: `https://<random>.ngrok.io/health`
+
+> Note: free ngrok URLs rotate.
 
 ## VPS + Caddy (auto-TLS) or Nginx (manual TLS)
 
@@ -56,17 +68,45 @@ mcp.yourdomain.com {
 # then: sudo systemctl reload caddy
 ```
 
-MCP URL: `https://mcp.yourdomain.com/mcp`
+MCP URL: `https://mcp.yourdomain.com/mcp`  
+Health: `https://mcp.yourdomain.com/health`
+
+---
+
+## Deep Research mode (read-only)
+
+You can run the same container/server in a read-only profile for Deep Research:
+
+```bash
+# Local
+DR_PROFILE=1 python server.py
+
+# Docker
+docker run --rm \
+  -p 8000:8000 \
+  -e APPLE_ID=you@example.com \
+  -e ICLOUD_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx \
+  -e DR_PROFILE=1 \
+  -e SCAN_DAYS=1095 \
+  icloud-mcp
+```
+
+In this mode the MCP surface only exposes:
+
+- `search(query)` -> list of matching events
+- `fetch(ids)` -> raw `text/calendar` ICS blobs
+
+No write tools are registered.
 
 ---
 
 ## Connect to ChatGPT
 
 1. ChatGPT -> **Settings -> Connectors -> Add custom connector**
-2. Enter your MCP endpoint (`https://…/mcp`) and save
-3. In a chat, select this connector and call tools:
-   * “Use **icloud-caldav** to `list_calendars`”
-   * “Create an event tomorrow 15:00–15:30 on calendar URL `<…>`”
-   * “Update event UID `<…>` to 16:00–16:20 and rename to ‘Study Session’”
+2. Enter your MCP endpoint (`https://…/mcp`) and save.
+3. In a chat, select this connector and call tools, for example:
+   * “Use **icloud-caldav** to `list_calendars`.”
+   * “Create an event tomorrow 15:00–15:30 on calendar URL `<…>` at *Bobst Library*.”
+   * “Update event UID `<…>` to 16:00–16:20 and move it to ‘Study Room B’.”
 
-> Availability of custom connectors depends on plan (please check their policy online). If the menu isn’t visible, upgrade to a plan that supports Connectors.
+> Availability of custom connectors depends on plan; if the menu isn’t visible, check OpenAI’s current plan requirements.
