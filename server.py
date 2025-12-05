@@ -42,7 +42,11 @@ DR_ONLY = os.environ.get("DR_PROFILE", "0") == "1"
 SCAN_DAYS = int(os.environ.get("SCAN_DAYS", str(LOOKBACK_YEARS * 365)))
 
 # Optional: simple logging
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 log = logging.getLogger("icloud-caldav")
 
 # MCP app
