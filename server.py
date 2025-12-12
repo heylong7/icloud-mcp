@@ -398,11 +398,16 @@ if not DR_ONLY:
         s = _parse_iso(start)
         e = _parse_iso(end)
 
-        # If naive, assume tzid
+        # Normalize to the requested/default TZID so event times are in that zone
+        tz = ZoneInfo(tzid)
         if s.tzinfo is None:
-            s = s.replace(tzinfo=ZoneInfo(tzid))
+            s = s.replace(tzinfo=tz)
+        else:
+            s = s.astimezone(tz)
         if e.tzinfo is None:
-            e = e.replace(tzinfo=ZoneInfo(tzid))
+            e = e.replace(tzinfo=tz)
+        else:
+            e = e.astimezone(tz)
 
         cal = _resolve_calendar(calendar_name_or_url)
 
@@ -415,9 +420,9 @@ if not DR_ONLY:
             "BEGIN:VEVENT",
             f"UID:{uid}",
             f"SUMMARY:{_ics_escape(summary)}",
-            # store in UTC to avoid VTIMEZONE issues
-            f"DTSTART:{_fmt_utc(s)}",
-            f"DTEND:{_fmt_utc(e)}",
+            # Store as local wall time in the env-specified / requested TZID
+            f"DTSTART;TZID={tzid}:{_fmt(s)}",
+            f"DTEND;TZID={tzid}:{_fmt(e)}",
         ]
         if location:
             ics_parts.append(f"LOCATION:{_ics_escape(location)}")
@@ -504,11 +509,16 @@ if not DR_ONLY:
         new_start   = _to_dt(start, old_dtstart)
         new_end     = _to_dt(end,   old_dtend if old_dtend is not None else (new_start + dt.timedelta(hours=1)))
 
-        # If naive, assume tzid
+        # Normalize updated times into the requested/default TZID
+        tz = ZoneInfo(tzid)
         if new_start.tzinfo is None:
-            new_start = new_start.replace(tzinfo=ZoneInfo(tzid))
+            new_start = new_start.replace(tzinfo=tz)
+        else:
+            new_start = new_start.astimezone(tz)
         if new_end.tzinfo is None:
-            new_end = new_end.replace(tzinfo=ZoneInfo(tzid))
+            new_end = new_end.replace(tzinfo=tz)
+        else:
+            new_end = new_end.astimezone(tz)
 
         # Decide final RRULE
         if clear_recurrence:
@@ -525,8 +535,8 @@ if not DR_ONLY:
             "BEGIN:VEVENT",
             f"UID:{uid}",
             f"SUMMARY:{_ics_escape(new_summary)}",
-            f"DTSTART:{_fmt_utc(new_start)}",
-            f"DTEND:{_fmt_utc(new_end)}",
+            f"DTSTART;TZID={tzid}:{_fmt(new_start)}",
+            f"DTEND;TZID={tzid}:{_fmt(new_end)}",
         ]
         if new_loc is not None and new_loc != "":
             lines.append(f"LOCATION:{_ics_escape(new_loc)}")
