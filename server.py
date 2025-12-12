@@ -8,6 +8,7 @@ import logging
 import datetime as dt
 from pathlib import Path
 from typing import List, Dict, Optional, Any
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -22,11 +23,13 @@ from caldav.lib import error as dav_error
 # Load .env that lives next to this file, regardless of CWD.
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=True)
 
+
 def _require_env(name: str, default: Optional[str] = None) -> str:
-    v = os.environ.get(name, default)
-    if not v:
+    """Return a required environment variable, or raise if missing."""
+    value = os.environ.get(name, default)
+    if not value:
         raise RuntimeError(f"Missing required env var: {name}")
-    return v.strip()
+    return value.strip()
 
 APPLE_ID: str    = _require_env("APPLE_ID")
 APP_PW: str      = _require_env("ICLOUD_APP_PASSWORD")
@@ -59,24 +62,27 @@ async def health(_: Request) -> PlainTextResponse:
 
 # CalDAV helpers
 
+
 def _client() -> DAVClient:
-    """Stateless DAV client factory."""
+    """Return a new stateless DAV client."""
     return DAVClient(url=CALDAV_URL, username=APPLE_ID, password=APP_PW)
 
+
 def _principal():
-    """Authenticated principal (raises on bad credentials)."""
+    """Return the authenticated CalDAV principal (raises on auth failure)."""
     return _client().principal()
 
+
 def _all_calendars():
-    """List all calendars for the authenticated principal."""
+    """Return all calendars for the authenticated principal."""
     return _principal().calendars()
 
+
 def _resolve_calendar(name_or_url: str):
-    """Return a caldav.Calendar object from a display name or absolute URL."""
-    pr = _principal()
-    for c in pr.calendars():
-        if c.name == name_or_url or str(c.url) == name_or_url:
-            return c
+    """Return a caldav.Calendar from a display name or absolute URL."""
+    for calendar in _all_calendars():
+        if calendar.name == name_or_url or str(calendar.url) == name_or_url:
+            return calendar
     # Fallback: instantiate by URL directly
     return _client().calendar(url=name_or_url)
 
@@ -88,9 +94,32 @@ def _parse_iso(s: str) -> dt.datetime:
         return dt.datetime.fromisoformat(s[:-1]).replace(tzinfo=dt.timezone.utc)
     return dt.datetime.fromisoformat(s)
 
+
+def _scan_window() -> tuple[dt.datetime, dt.datetime]:
+    """Return the time window used for DR search/fetch operations."""
+    now = dt.datetime.now(dt.timezone.utc)
+    start = now - dt.timedelta(days=SCAN_DAYS)
+    end = now + dt.timedelta(days=SCAN_DAYS)
+    return start, end
+
+
+def _uid_search_window() -> tuple[dt.datetime, dt.datetime]:
+    """Return the wide time window used for UID-based lookups."""
+    now = dt.datetime.now(dt.timezone.utc)
+    delta = dt.timedelta(days=365 * LOOKBACK_YEARS)
+    return now - delta, now + delta
+
 def _fmt(ts: dt.datetime) -> str:
     """Format as 'YYYYMMDDTHHMMSS' for ICS."""
     return ts.strftime("%Y%m%dT%H%M%S")
+
+def _fmt_utc(ts: dt.datetime) -> str:
+    """Format as 'YYYYMMDDTHHMMSSZ' in UTC for ICS."""
+    # If naive, assume default TZ, then convert to UTC
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=ZoneInfo(DEFAULT_TZID))
+    ts_utc = ts.astimezone(dt.timezone.utc)
+    return ts_utc.strftime("%Y%m%dT%H%M%SZ")
 
 def _ics_escape(text: str) -> str:
     """Minimal ICS escaping for SUMMARY/DESCRIPTION."""
@@ -112,6 +141,99 @@ def _to_iso(o) -> Optional[str]:
     except Exception:
         return str(o)
 
+def _build_rrule(
+    recurrence: Optional[Dict[str, Any]],
+    tzid: str,
+    dtstart: Optional[dt.datetime] = None,
+) -> Optional[str]:
+    """
+    Build an RFC5545 RRULE value from a high-level recurrence dict.
+
+    recurrence:
+      {
+        "frequency": "daily" | "weekly" | "monthly" | "yearly" | "custom",
+        "interval": int (default 1),
+        "by_weekday": ["MO","TU",...],      # optional, for weekly/custom
+        "by_monthday": [1,15,...],         # optional, for monthly/custom
+        "end": {
+          "type": "on_date",               # UNTIL
+          "date": "YYYY-MM-DD" | ISO dt
+          # or
+          # "type": "after_occurrences",   # COUNT
+          # "count": int
+        },
+        # for frequency == "custom":
+        # "rrule": "FREQ=...;BYDAY=...;..."
+      }
+    """
+    if not recurrence:
+        return None
+
+    freq = (recurrence.get("frequency") or "").lower()
+    if not freq:
+        return None
+
+    # Custom raw RRULE passthrough
+    if freq == "custom":
+        raw = recurrence.get("rrule")
+        return str(raw).strip() if raw else None
+
+    freq_map = {
+        "daily": "DAILY",
+        "weekly": "WEEKLY",
+        "monthly": "MONTHLY",
+        "yearly": "YEARLY",
+    }
+    if freq not in freq_map:
+        return None
+
+    parts: List[str] = [f"FREQ={freq_map[freq]}"]
+
+    interval = recurrence.get("interval")
+    if isinstance(interval, int) and interval > 1:
+        parts.append(f"INTERVAL={interval}")
+
+    by_weekday = recurrence.get("by_weekday") or []
+    if by_weekday:
+        days = [str(d).upper() for d in by_weekday]
+        parts.append(f"BYDAY={','.join(days)}")
+    elif freq == "weekly" and dtstart is not None:
+        # Default weekly: same weekday as dtstart
+        weekday_map = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+        parts.append(f"BYDAY={weekday_map[dtstart.weekday()]}")
+
+    by_monthday = recurrence.get("by_monthday") or []
+    if by_monthday:
+        days = [str(int(d)) for d in by_monthday]
+        parts.append(f"BYMONTHDAY={','.join(days)}")
+
+    end = recurrence.get("end") or {}
+    end_type = (end.get("type") or "").lower()
+    if end_type == "on_date":
+        date_str = end.get("date")
+        if date_str:
+            # Interpret as local in tzid, convert to UTC, format as UNTIL=...Z
+            try:
+                if len(date_str) == 10:
+                    y, m, d = map(int, date_str.split("-"))
+                    local_dt = dt.datetime(y, m, d, 23, 59, 59)
+                else:
+                    local_dt = dt.datetime.fromisoformat(date_str)
+                if local_dt.tzinfo is None:
+                    local_dt = local_dt.replace(tzinfo=ZoneInfo(tzid))
+                until_utc = local_dt.astimezone(dt.timezone.utc)
+                until_str = until_utc.strftime("%Y%m%dT%H%M%SZ")
+                parts.append(f"UNTIL={until_str}")
+            except Exception:
+                # If parsing fails, skip UNTIL
+                pass
+    elif end_type == "after_occurrences":
+        count = end.get("count")
+        if isinstance(count, int) and count > 0:
+            parts.append(f"COUNT={count}")
+
+    return ";".join(parts) if parts else None
+
 # DR profile: read-only search/fetch
 if DR_ONLY:
 
@@ -127,9 +249,8 @@ if DR_ONLY:
         q = (query or "").strip().lower()
         if not q:
             return []
-        now = dt.datetime.now(dt.timezone.utc)
-        start = now - dt.timedelta(days=SCAN_DAYS)
-        end = now + dt.timedelta(days=SCAN_DAYS)
+
+        start, end = _scan_window()
 
         rows: List[Dict[str, Any]] = []
         for cal in _all_calendars():
@@ -158,10 +279,8 @@ if DR_ONLY:
         Returns [{ id, mimeType: 'text/calendar', content }]
         """
         ids = ids or []
-        calendars = {str(c.url): c for c in _all_calendars()}
-        now = dt.datetime.now(dt.timezone.utc)
-        start = now - dt.timedelta(days=SCAN_DAYS)
-        end = now + dt.timedelta(days=SCAN_DAYS)
+        calendars = {str(calendar.url): calendar for calendar in _all_calendars()}
+        start, end = _scan_window()
 
         out: List[Dict[str, Any]] = []
         for ident in ids:
@@ -195,14 +314,16 @@ if not DR_ONLY:
         """
         Return available calendar containers with their name and URL.
         """
-        pr = _principal()
+        calendars = _all_calendars()
         out: List[Dict[str, Any]] = []
-        for cal in pr.calendars():
-            out.append({
-                "name": getattr(cal, "name", None),
-                "url": str(cal.url),
-                "id": getattr(cal, "id", None),
-            })
+        for calendar in calendars:
+            out.append(
+                {
+                    "name": getattr(calendar, "name", None),
+                    "url": str(calendar.url),
+                    "id": getattr(calendar, "id", None),
+                }
+            )
         return out
 
     @mcp.tool()
@@ -210,7 +331,7 @@ if not DR_ONLY:
         calendar_name_or_url: str,
         start: str,
         end: str,
-        expand_recurring: bool = True
+        expand_recurring: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         List events between ISO datetimes [start, end).
@@ -247,19 +368,46 @@ if not DR_ONLY:
         tzid: Optional[str] = None,
         description: Optional[str] = None,
         location: Optional[str] = None,
+        recurrence: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Create an event in the given calendar.
+
         start/end: ISO datetimes, local or '...Z' for UTC.
-        tzid: IANA TZ (e.g., 'America/New_York'). If omitted, uses DEFAULT_TZID.
+        tzid:     IANA TZ name (e.g., 'America/New_York'); used if times are naive.
+        recurrence: optional dict, e.g.:
+
+          {
+            "frequency": "daily" | "weekly" | "monthly" | "yearly" | "custom",
+            "interval": 1,
+            "by_weekday": ["MO","WE"],
+            "by_monthday": [1,15],
+            "end": {
+              "type": "on_date",           # or "after_occurrences"
+              "date": "2025-12-31",       # for on_date
+              # or:
+              # "type": "after_occurrences",
+              # "count": 10
+            },
+            # for custom:
+            # "rrule": "FREQ=MONTHLY;BYDAY=MO,TU;BYSETPOS=1"
+          }
         """
+        tzid = tzid or DEFAULT_TZID
+
         s = _parse_iso(start)
         e = _parse_iso(end)
-        tzid = tzid or DEFAULT_TZID
+
+        # If naive, assume tzid
+        if s.tzinfo is None:
+            s = s.replace(tzinfo=ZoneInfo(tzid))
+        if e.tzinfo is None:
+            e = e.replace(tzinfo=ZoneInfo(tzid))
 
         cal = _resolve_calendar(calendar_name_or_url)
 
         uid = os.urandom(16).hex() + "@chatgpt-mcp"
+
         ics_parts = [
             "BEGIN:VCALENDAR",
             "VERSION:2.0",
@@ -267,13 +415,19 @@ if not DR_ONLY:
             "BEGIN:VEVENT",
             f"UID:{uid}",
             f"SUMMARY:{_ics_escape(summary)}",
-            f"DTSTART;TZID={tzid}:{_fmt(s)}",
-            f"DTEND;TZID={tzid}:{_fmt(e)}",
+            # store in UTC to avoid VTIMEZONE issues
+            f"DTSTART:{_fmt_utc(s)}",
+            f"DTEND:{_fmt_utc(e)}",
         ]
-        if location:  # empty string => no LOCATION line on create
+        if location:
             ics_parts.append(f"LOCATION:{_ics_escape(location)}")
         if description:
             ics_parts.append(f"DESCRIPTION:{_ics_escape(description)}")
+
+        rrule = _build_rrule(recurrence, tzid=tzid, dtstart=s)
+        if rrule:
+            ics_parts.append(f"RRULE:{rrule}")
+
         ics_parts += ["END:VEVENT", "END:VCALENDAR"]
 
         cal.save_event("\n".join(ics_parts))
@@ -284,50 +438,27 @@ if not DR_ONLY:
         calendar_name_or_url: str,
         uid: str,
         summary: Optional[str] = None,
-        start: Optional[str] = None,   # ISO datetime, local or '...Z'
-        end: Optional[str] = None,     # ISO datetime, local or '...Z'
-        tzid: Optional[str] = None,    # IANA TZ; defaults to DEFAULT_TZID if not derivable
+        start: Optional[str] = None,   # ISO datetime
+        end: Optional[str] = None,     # ISO datetime
+        tzid: Optional[str] = None,
         description: Optional[str] = None,
         location: Optional[str] = None,
+        recurrence: Optional[Dict[str, Any]] = None,
+        clear_recurrence: bool = False,
     ) -> bool:
         """
-        Update a single VEVENT identified by UID in the given calendar.
+        Update a VEVENT identified by UID.
 
-        Parameters
-        ----------
-        calendar_name_or_url: str
-            Either the display name or absolute CalDAV URL of the calendar containing the event.
-        uid: str
-            The unique identifier of the event to update.
-        summary: Optional[str]
-            New event summary. If not provided, the existing summary is preserved.
-        start: Optional[str]
-            New start datetime in ISO format. If not provided, the existing start is preserved.
-        end: Optional[str]
-            New end datetime in ISO format. If not provided, the existing end is preserved.
-        tzid: Optional[str]
-            Time zone identifier. If omitted, defaults to the original event's TZID or DEFAULT_TZID.
-        description: Optional[str]
-            New event description. If not provided, the existing description is preserved.
-        location: Optional[str]
-            New event location. If not provided, the existing location is preserved. To clear the
-            location, pass an empty string.
-
-        Returns:
-        bool
-            True if an event was updated, else False (if the UID was not found).
-
-        Notes:
-        - Updates the whole event (series, if recurring), not a single instance.
-        - Rich properties (alarms, attendees, recurrences) are preserved only
-          to the extent they exist in the original component; we rewrite a minimal event.
+        - If recurrence is provided, replaces existing RRULE.
+        - If clear_recurrence is True, removes any RRULE.
+        - If neither is provided, preserves existing RRULE.
         """
+        tzid = tzid or DEFAULT_TZID
+
         cal = _resolve_calendar(calendar_name_or_url)
 
-        # Find target event by UID across a generous window
-        now = dt.datetime.now(dt.timezone.utc)
-        s_window = now - dt.timedelta(days=365 * LOOKBACK_YEARS)
-        e_window = now + dt.timedelta(days=365 * LOOKBACK_YEARS)
+        # Search wide window for matching UID
+        s_window, e_window = _uid_search_window()
 
         target = None
         for ev in cal.search(event=True, start=s_window, end=e_window, expand=False):
@@ -345,6 +476,21 @@ if not DR_ONLY:
         old_dtstart = comp.decoded("dtstart")
         old_dtend   = comp.decoded("dtend", default=None)
 
+        # Existing RRULE, if any
+        old_rrule_str: Optional[str] = None
+        try:
+            old_rrule_prop = comp.get("rrule")
+            if old_rrule_prop is not None:
+                if hasattr(old_rrule_prop, "to_ical"):
+                    raw = old_rrule_prop.to_ical()
+                    if isinstance(raw, bytes):
+                        raw = raw.decode()
+                    old_rrule_str = str(raw).strip()
+                else:
+                    old_rrule_str = str(old_rrule_prop).strip()
+        except Exception:
+            old_rrule_str = None
+
         def _to_dt(s: Optional[str], fallback: dt.datetime) -> dt.datetime:
             if s is None:
                 return fallback
@@ -358,31 +504,39 @@ if not DR_ONLY:
         new_start   = _to_dt(start, old_dtstart)
         new_end     = _to_dt(end,   old_dtend if old_dtend is not None else (new_start + dt.timedelta(hours=1)))
 
-        # Keep original TZID if present; else requested; else default.
-        try:
-            orig_tzid = comp["dtstart"].params.get("TZID") if "dtstart" in comp and hasattr(comp["dtstart"], "params") else None
-        except Exception:
-            orig_tzid = None
-        use_tzid = tzid or orig_tzid or DEFAULT_TZID
+        # If naive, assume tzid
+        if new_start.tzinfo is None:
+            new_start = new_start.replace(tzinfo=ZoneInfo(tzid))
+        if new_end.tzinfo is None:
+            new_end = new_end.replace(tzinfo=ZoneInfo(tzid))
 
-        # Build a minimal VEVENT. Include LOCATION only when non-empty so callers can clear
-        # it by passing an empty string. All text fields are escaped according to RFC 5545.
-        new_ics = "\n".join([
+        # Decide final RRULE
+        if clear_recurrence:
+            effective_rrule: Optional[str] = None
+        elif recurrence is not None:
+            effective_rrule = _build_rrule(recurrence, tzid=tzid, dtstart=new_start)
+        else:
+            effective_rrule = old_rrule_str
+
+        lines: List[str] = [
             "BEGIN:VCALENDAR",
             "VERSION:2.0",
             "PRODID:-//ChatGPT MCP iCloud CalDAV//EN",
             "BEGIN:VEVENT",
             f"UID:{uid}",
             f"SUMMARY:{_ics_escape(new_summary)}",
-            f"DTSTART;TZID={use_tzid}:{_fmt(new_start)}",
-            f"DTEND;TZID={use_tzid}:{_fmt(new_end)}",
-            *( [f"LOCATION:{_ics_escape(new_loc)}"] if new_loc is not None and new_loc != "" else [] ),
-            *( [f"DESCRIPTION:{_ics_escape(new_desc)}"] if new_desc else [] ),
-            "END:VEVENT",
-            "END:VCALENDAR",
-        ])
+            f"DTSTART:{_fmt_utc(new_start)}",
+            f"DTEND:{_fmt_utc(new_end)}",
+        ]
+        if new_loc is not None and new_loc != "":
+            lines.append(f"LOCATION:{_ics_escape(new_loc)}")
+        if new_desc:
+            lines.append(f"DESCRIPTION:{_ics_escape(new_desc)}")
+        if effective_rrule:
+            lines.append(f"RRULE:{effective_rrule}")
+        lines += ["END:VEVENT", "END:VCALENDAR"]
 
-        target.data = new_ics
+        target.data = "\n".join(lines)
         target.save()
         return True
 
@@ -394,9 +548,7 @@ if not DR_ONLY:
         """
         cal = _resolve_calendar(calendar_name_or_url)
 
-        now = dt.datetime.now(dt.timezone.utc)
-        start = now - dt.timedelta(days=365 * LOOKBACK_YEARS)
-        end   = now + dt.timedelta(days=365 * LOOKBACK_YEARS)
+        start, end = _uid_search_window()
 
         for ev in cal.search(event=True, start=start, end=end, expand=False):
             comp = ev.component

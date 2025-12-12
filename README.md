@@ -15,12 +15,15 @@ I built this to use in ChatGPT Custom Connector, so I can change my iCloud Calen
 ## Features
 
 - HTTP MCP server (`/mcp`) + `GET /health`
-- Tools:
+- Tools (default write-capable profile):
   - `list_calendars()`
   - `list_events(calendar_name_or_url, start, end, expand_recurring=True)`
-  - `create_event(calendar_name_or_url, summary, start, end, tzid?, description?, location?)`
-  - `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?)`
+  - `create_event(calendar_name_or_url, summary, start, end, tzid?, description?, location?, recurrence?)`
+  - `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?, recurrence?, clear_recurrence=False)`
   - `delete_event(calendar_name_or_url, uid)`
+- Tools (Deep Research read-only profile):
+  - `search(query)` → basic text search over SUMMARY/DESCRIPTION in a time window
+  - `fetch(ids)` → fetch raw `text/calendar` ICS blobs for search results
 - ISO datetime input (`YYYY-MM-DDTHH:MM:SS`, with optional `Z` or timezone offset)
 - Minimal ICS generation (summary/description escaping), UID matching across a ±3-year window
 
@@ -99,16 +102,35 @@ Returns:
 - `end: str | null` (ISO)
 - `raw: str` (original ICS text)
 
-### `create_event(calendar_name_or_url, summary, start, end, tzid?, description?, location?) -> str`
+### `create_event(calendar_name_or_url, summary, start, end, tzid?, description?, location?, recurrence?) -> str`
 
 Creates a minimal **VEVENT**.
 
-- `tzid` defaults to `TZID` env if omitted.
+- `tzid` defaults to `TZID` env if omitted; naive datetimes are assumed in that zone and stored as UTC.
 - `description` is optional; omit or pass `null` to skip it.
 - `location` is optional; omit or pass `null` to skip it.
+- `recurrence` (optional) describes how the event should repeat, for example:
+
+    ```jsonc
+    {
+        "frequency": "weekly",              // daily | weekly | monthly | yearly | custom
+        "interval": 1,                       // optional, default 1
+        "by_weekday": ["MO", "WE"],         // optional; for weekly/custom
+        "by_monthday": [1, 15],             // optional; for monthly/custom
+        "end": {                            // optional end condition
+            "type": "on_date",              // or "after_occurrences"
+            "date": "2025-12-31"            // when type == "on_date"
+            // or: "count": 10               // when type == "after_occurrences"
+        }
+        // for custom frequency you can pass a raw RRULE:
+        // "frequency": "custom",
+        // "rrule": "FREQ=MONTHLY;BYDAY=MO,TU;BYSETPOS=1"
+    }
+    ```
+
 - Returns the generated `uid` (random hex + `@chatgpt-mcp`).
 
-### `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?) -> bool`
+### `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?, recurrence?, clear_recurrence=False) -> bool`
 
 Updates the **whole** event identified by `uid` (for recurring events this updates the series VEVENT, not a single instance).
 
@@ -117,6 +139,11 @@ Updates the **whole** event identified by `uid` (for recurring events this updat
   - If omitted (`null` / not provided), keeps the existing location.
   - If provided as a non-empty string, updates the event’s location.
   - If provided as an empty string, clears the event’s location.
+- `recurrence`:
+  - If provided, replaces any existing RRULE using the same shape as in `create_event`.
+- `clear_recurrence`:
+  - If `True`, removes any RRULE and converts the event back to a single non-recurring instance.
+  - If `True` and `recurrence` is also provided, `clear_recurrence` wins (no recurrence).
 - Returns `True` on success, `False` if `uid` not found in ±3-year window.
 
 ### `delete_event(calendar_name_or_url, uid) -> bool`

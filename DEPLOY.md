@@ -44,15 +44,33 @@ Health: `https://mcp.yourdomain.com/health`
 ```bash
 brew install ngrok/ngrok/ngrok
 ngrok config add-authtoken <YOUR_TOKEN>
+
+# In another terminal, run the MCP server with a shared secret:
+export MCP_AUTH_TOKEN="$(python - <<'PY'
+import secrets
+print(secrets.token_urlsafe(32))
+PY
+)"
+python server.py
+```
+
+Then expose it:
+
+```bash
 ngrok http 8000
 ```
 
 Use the printed https URL:
 
 - MCP: `https://<random>.ngrok.io/mcp`
-- Health: `https://<random>.ngrok.io/health`
+- Health: `https://<random>.ngrok.io/health` (does **not** require the token)
 
-> Note: free ngrok URLs rotate.
+### MCP auth header
+
+Configure your MCP client / ChatGPT custom connector to send:
+
+- Header: `X-Auth-Token`
+- Value: `<same value as MCP_AUTH_TOKEN>`
 
 ## VPS + Caddy (auto-TLS) or Nginx (manual TLS)
 
