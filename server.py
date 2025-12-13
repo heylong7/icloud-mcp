@@ -141,6 +141,69 @@ def _to_iso(o) -> Optional[str]:
     except Exception:
         return str(o)
 
+
+def _parse_iso_or_default(value: Optional[str], fallback: dt.datetime) -> dt.datetime:
+    """Parse an ISO datetime string or return the fallback if missing.
+
+    This mirrors ``_parse_iso`` semantics but handles ``None`` by
+    returning ``fallback``. Non-empty strings that fail to parse will
+    still raise, preserving the original behavior.
+    """
+    if value is None:
+        return fallback
+    return _parse_iso(value)
+
+
+def _normalize_to_tz(ts: dt.datetime, tzid: str) -> dt.datetime:
+    """Return ``ts`` normalized into the given IANA timezone.
+
+    Naive datetimes are treated as wall time in ``tzid``; aware
+    datetimes are converted.
+    """
+    tz = ZoneInfo(tzid)
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=tz)
+    return ts.astimezone(tz)
+
+
+def _build_vevent_ics(
+    uid: str,
+    summary: str,
+    start: dt.datetime,
+    end: dt.datetime,
+    tzid: str,
+    description: Optional[str],
+    location: Optional[str],
+    rrule: Optional[str],
+    *,
+    include_location: bool,
+) -> str:
+    """Build a minimal VEVENT ICS blob.
+
+    The resulting text matches the layout used by ``create_event`` and
+    ``update_event`` so existing behavior is preserved.
+    """
+    lines: List[str] = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//ChatGPT MCP iCloud CalDAV//EN",
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"SUMMARY:{_ics_escape(summary)}",
+        f"DTSTART;TZID={tzid}:{_fmt(start)}",
+        f"DTEND;TZID={tzid}:{_fmt(end)}",
+    ]
+
+    if include_location and location is not None and location != "":
+        lines.append(f"LOCATION:{_ics_escape(location)}")
+    if description:
+        lines.append(f"DESCRIPTION:{_ics_escape(description)}")
+    if rrule:
+        lines.append(f"RRULE:{rrule}")
+
+    lines += ["END:VEVENT", "END:VCALENDAR"]
+    return "\n".join(lines)
+
 def _build_rrule(
     recurrence: Optional[Dict[str, Any]],
     tzid: str,
@@ -327,6 +390,46 @@ if not DR_ONLY:
         return out
 
     @mcp.tool()
+    def list_calendars_with_events(
+        start: str,
+        end: str,
+        expand_recurring: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return calendars that have at least one event between ISO datetimes
+        [start, end).
+
+        Each item mirrors ``list_calendars`` but is filtered to only those
+        calendars that contain at least one matching event in the range.
+        """
+        s = _parse_iso(start)
+        e = _parse_iso(end)
+
+        calendars = _all_calendars()
+        out: List[Dict[str, Any]] = []
+
+        for calendar in calendars:
+            try:
+                has_event = False
+                for _ in calendar.search(event=True, start=s, end=e, expand=expand_recurring):
+                    has_event = True
+                    break
+                if has_event:
+                    out.append(
+                        {
+                            "name": getattr(calendar, "name", None),
+                            "url": str(calendar.url),
+                            "id": getattr(calendar, "id", None),
+                        }
+                    )
+            except dav_error.DAVError as exc:
+                log.warning("CalDAV search failed for calendar %s: %s", getattr(calendar, "name", calendar), exc)
+            except Exception:
+                log.exception("Unexpected error while scanning calendar %r for events", getattr(calendar, "name", calendar))
+
+        return out
+
+    @mcp.tool()
     def list_events(
         calendar_name_or_url: str,
         start: str,
@@ -395,47 +498,27 @@ if not DR_ONLY:
         """
         tzid = tzid or DEFAULT_TZID
 
-        s = _parse_iso(start)
-        e = _parse_iso(end)
-
-        # Normalize to the requested/default TZID so event times are in that zone
-        tz = ZoneInfo(tzid)
-        if s.tzinfo is None:
-            s = s.replace(tzinfo=tz)
-        else:
-            s = s.astimezone(tz)
-        if e.tzinfo is None:
-            e = e.replace(tzinfo=tz)
-        else:
-            e = e.astimezone(tz)
+        s = _normalize_to_tz(_parse_iso(start), tzid)
+        e = _normalize_to_tz(_parse_iso(end), tzid)
 
         cal = _resolve_calendar(calendar_name_or_url)
 
         uid = os.urandom(16).hex() + "@chatgpt-mcp"
-
-        ics_parts = [
-            "BEGIN:VCALENDAR",
-            "VERSION:2.0",
-            "PRODID:-//ChatGPT MCP iCloud CalDAV//EN",
-            "BEGIN:VEVENT",
-            f"UID:{uid}",
-            f"SUMMARY:{_ics_escape(summary)}",
-            # Store as local wall time in the env-specified / requested TZID
-            f"DTSTART;TZID={tzid}:{_fmt(s)}",
-            f"DTEND;TZID={tzid}:{_fmt(e)}",
-        ]
-        if location:
-            ics_parts.append(f"LOCATION:{_ics_escape(location)}")
-        if description:
-            ics_parts.append(f"DESCRIPTION:{_ics_escape(description)}")
-
         rrule = _build_rrule(recurrence, tzid=tzid, dtstart=s)
-        if rrule:
-            ics_parts.append(f"RRULE:{rrule}")
 
-        ics_parts += ["END:VEVENT", "END:VCALENDAR"]
+        ics_text = _build_vevent_ics(
+            uid=uid,
+            summary=summary,
+            start=s,
+            end=e,
+            tzid=tzid,
+            description=description,
+            location=location,
+            rrule=rrule,
+            include_location=bool(location),
+        )
 
-        cal.save_event("\n".join(ics_parts))
+        cal.save_event(ics_text)
         return uid
 
     @mcp.tool()
@@ -496,29 +579,16 @@ if not DR_ONLY:
         except Exception:
             old_rrule_str = None
 
-        def _to_dt(s: Optional[str], fallback: dt.datetime) -> dt.datetime:
-            if s is None:
-                return fallback
-            if s.endswith("Z"):
-                return dt.datetime.fromisoformat(s[:-1]).replace(tzinfo=dt.timezone.utc)
-            return dt.datetime.fromisoformat(s)
-
         new_summary = summary if summary is not None else old_summary
         new_desc    = description if description is not None else old_desc
         new_loc     = location if location is not None else old_loc
-        new_start   = _to_dt(start, old_dtstart)
-        new_end     = _to_dt(end,   old_dtend if old_dtend is not None else (new_start + dt.timedelta(hours=1)))
+        new_start   = _parse_iso_or_default(start, old_dtstart)
+        new_end_fallback = old_dtend if old_dtend is not None else (new_start + dt.timedelta(hours=1))
+        new_end     = _parse_iso_or_default(end, new_end_fallback)
 
         # Normalize updated times into the requested/default TZID
-        tz = ZoneInfo(tzid)
-        if new_start.tzinfo is None:
-            new_start = new_start.replace(tzinfo=tz)
-        else:
-            new_start = new_start.astimezone(tz)
-        if new_end.tzinfo is None:
-            new_end = new_end.replace(tzinfo=tz)
-        else:
-            new_end = new_end.astimezone(tz)
+        new_start = _normalize_to_tz(new_start, tzid)
+        new_end = _normalize_to_tz(new_end, tzid)
 
         # Decide final RRULE
         if clear_recurrence:
@@ -528,25 +598,19 @@ if not DR_ONLY:
         else:
             effective_rrule = old_rrule_str
 
-        lines: List[str] = [
-            "BEGIN:VCALENDAR",
-            "VERSION:2.0",
-            "PRODID:-//ChatGPT MCP iCloud CalDAV//EN",
-            "BEGIN:VEVENT",
-            f"UID:{uid}",
-            f"SUMMARY:{_ics_escape(new_summary)}",
-            f"DTSTART;TZID={tzid}:{_fmt(new_start)}",
-            f"DTEND;TZID={tzid}:{_fmt(new_end)}",
-        ]
-        if new_loc is not None and new_loc != "":
-            lines.append(f"LOCATION:{_ics_escape(new_loc)}")
-        if new_desc:
-            lines.append(f"DESCRIPTION:{_ics_escape(new_desc)}")
-        if effective_rrule:
-            lines.append(f"RRULE:{effective_rrule}")
-        lines += ["END:VEVENT", "END:VCALENDAR"]
+        ics_text = _build_vevent_ics(
+            uid=uid,
+            summary=new_summary,
+            start=new_start,
+            end=new_end,
+            tzid=tzid,
+            description=new_desc,
+            location=new_loc,
+            rrule=effective_rrule,
+            include_location=new_loc is not None and new_loc != "",
+        )
 
-        target.data = "\n".join(lines)
+        target.data = ics_text
         target.save()
         return True
 

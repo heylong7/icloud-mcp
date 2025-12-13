@@ -17,6 +17,7 @@ I built this to use in ChatGPT Custom Connector, so I can change my iCloud Calen
 - HTTP MCP server (`/mcp`) + `GET /health`
 - Tools (default write-capable profile):
   - `list_calendars()`
+  - `list_calendars_with_events(start, end, expand_recurring=True)`
   - `list_events(calendar_name_or_url, start, end, expand_recurring=True)`
   - `create_event(calendar_name_or_url, summary, start, end, tzid?, description?, location?, recurrence?)`
   - `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?, recurrence?, clear_recurrence=False)`
@@ -85,6 +86,18 @@ Returns:
 - `name: str | null`
 - `url: str` (preferred identifier for other calls)
 - `id: str | null`
+
+### `list_calendars_with_events(start, end, expand_recurring=True) -> List[Calendar]`
+
+Returns only the calendars that contain **at least one event** in the
+given time window.
+
+**Args**
+
+- `start, end: str` — ISO datetimes; search is [**start**, **end**)
+- `expand_recurring: bool` — treat recurring series as concrete instances
+
+Each returned calendar has the same shape as `list_calendars()`.
 
 ### `list_events(calendar_name_or_url, start, end, expand_recurring=True) -> List[Event]`
 
