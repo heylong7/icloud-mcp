@@ -6,14 +6,20 @@ from __future__ import annotations
 import os
 import logging
 import datetime as dt
+import secrets
+import hashlib
+import base64
+import time
+import html as html_lib
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse, JSONResponse, HTMLResponse, RedirectResponse
 
 from caldav.davclient import DAVClient
 from caldav.lib import error as dav_error
@@ -44,6 +50,18 @@ SERVER_PORT = int(os.environ.get("PORT", "8000"))
 DR_ONLY = os.environ.get("DR_PROFILE", "0") == "1"
 SCAN_DAYS = int(os.environ.get("SCAN_DAYS", str(LOOKBACK_YEARS * 365)))
 
+# OAuth config — if both vars are set, Bearer-token auth is enforced on /mcp
+OAUTH_CLIENT_ID     = os.environ.get("OAUTH_CLIENT_ID", "").strip()
+OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "").strip()
+OAUTH_ENABLED       = bool(OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET)
+
+CODE_TTL  = 60           # auth codes expire in 60 seconds
+TOKEN_TTL = 86400 * 30   # access tokens live 30 days
+
+# In-memory OAuth state (tokens lost on restart — user re-authorizes after deploys)
+_auth_codes: dict[str, dict] = {}    # code → {client_id, redirect_uri, code_challenge, ...}
+_access_tokens: dict[str, dict] = {} # token → {client_id, expires_at}
+
 # Optional: simple logging
 logging.basicConfig(
     level=logging.INFO,
@@ -52,6 +70,47 @@ logging.basicConfig(
 )
 log = logging.getLogger("icloud-caldav")
 
+
+# OAuth helpers
+
+def _verify_pkce(verifier: str, challenge: str, method: str) -> bool:
+    """Verify an OAuth 2.0 PKCE code_verifier against a stored code_challenge."""
+    if method == "S256":
+        digest = hashlib.sha256(verifier.encode()).digest()
+        expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        return secrets.compare_digest(expected, challenge)
+    if method == "plain":
+        return secrets.compare_digest(verifier, challenge)
+    return False
+
+
+class _BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Require a valid Bearer token on /mcp when OAuth is enabled."""
+    _SKIP = {"/.well-known/oauth-authorization-server", "/authorize", "/token", "/health"}
+
+    async def dispatch(self, request, call_next):
+        if not OAUTH_ENABLED or request.url.path in self._SKIP:
+            return await call_next(request)
+
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return JSONResponse(
+                {"error": "unauthorized"},
+                status_code=401,
+                headers={"WWW-Authenticate": 'Bearer realm="icloud-mcp"'},
+            )
+        token = auth[7:].strip()
+        entry = _access_tokens.get(token)
+        if not entry or entry["expires_at"] < time.time():
+            _access_tokens.pop(token, None)
+            return JSONResponse(
+                {"error": "invalid_token"},
+                status_code=401,
+                headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+            )
+        return await call_next(request)
+
+
 # MCP app
 
 mcp = FastMCP("icloud-caldav")
@@ -59,6 +118,127 @@ mcp = FastMCP("icloud-caldav")
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request) -> PlainTextResponse:
     return PlainTextResponse("OK")
+
+
+@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+async def oauth_metadata(request: Request) -> JSONResponse:
+    base = str(request.base_url).rstrip("/")
+    return JSONResponse({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "response_types_supported": ["code"],
+        "code_challenge_methods_supported": ["S256"],
+        "grant_types_supported": ["authorization_code"],
+    })
+
+
+@mcp.custom_route("/authorize", methods=["GET", "POST"])
+async def authorize(request: Request):
+    esc = html_lib.escape
+    if request.method == "GET":
+        params = dict(request.query_params)
+        hidden = "".join(
+            f'<input type="hidden" name="{esc(k)}" value="{esc(v)}">'
+            for k, v in params.items()
+        )
+        page = f"""<!DOCTYPE html>
+<html><head><title>iCloud MCP — Authorize</title>
+<style>
+  body {{font-family:system-ui;max-width:440px;margin:4em auto;padding:0 1.5em;color:#1d1d1f}}
+  h2 {{font-size:1.4rem;margin-bottom:.5em}}
+  p  {{color:#6e6e73;margin-bottom:1.5em}}
+  button {{background:#0071e3;color:#fff;border:none;padding:.75em 1.75em;
+           border-radius:8px;font-size:1rem;cursor:pointer}}
+  button:hover {{background:#0077ed}}
+</style></head><body>
+<h2>Allow access to your iCloud Calendar?</h2>
+<p>Client: <strong>{esc(params.get("client_id", ""))}</strong></p>
+<form method="POST">{hidden}
+  <button type="submit">Authorize</button>
+</form></body></html>"""
+        return HTMLResponse(page)
+
+    # POST — user clicked Authorize
+    form = await request.form()
+    client_id             = str(form.get("client_id", ""))
+    redirect_uri          = str(form.get("redirect_uri", ""))
+    code_challenge        = str(form.get("code_challenge", ""))
+    code_challenge_method = str(form.get("code_challenge_method", "S256"))
+    state                 = str(form.get("state", ""))
+
+    if not OAUTH_ENABLED or client_id != OAUTH_CLIENT_ID:
+        return JSONResponse({"error": "invalid_client"}, status_code=400)
+    if not redirect_uri:
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "redirect_uri required"},
+            status_code=400,
+        )
+
+    code = secrets.token_urlsafe(32)
+    _auth_codes[code] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "expires_at": time.time() + CODE_TTL,
+    }
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}code={code}" + (f"&state={state}" if state else "")
+    return RedirectResponse(location, status_code=302)
+
+
+@mcp.custom_route("/token", methods=["POST"])
+async def token_endpoint(request: Request) -> JSONResponse:
+    form          = await request.form()
+    grant_type    = str(form.get("grant_type", ""))
+    code          = str(form.get("code", ""))
+    redirect_uri  = str(form.get("redirect_uri", ""))
+    code_verifier = str(form.get("code_verifier", ""))
+    client_id     = str(form.get("client_id", ""))
+    client_secret = str(form.get("client_secret", ""))
+
+    # Also accept HTTP Basic Auth (some clients send credentials this way)
+    basic = request.headers.get("Authorization", "")
+    if basic.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(basic[6:]).decode()
+            client_id, _, client_secret = decoded.partition(":")
+        except Exception:
+            pass
+
+    if not OAUTH_ENABLED:
+        return JSONResponse({"error": "oauth_not_configured"}, status_code=503)
+    if grant_type != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+    if not client_id or not client_secret:
+        return JSONResponse({"error": "invalid_client"}, status_code=401)
+    if not secrets.compare_digest(client_id, OAUTH_CLIENT_ID) or \
+       not secrets.compare_digest(client_secret, OAUTH_CLIENT_SECRET):
+        return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+    entry = _auth_codes.pop(code, None)
+    if not entry or entry["expires_at"] < time.time():
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    if entry["redirect_uri"] != redirect_uri or entry["client_id"] != client_id:
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    if entry["code_challenge"] and not _verify_pkce(
+        code_verifier, entry["code_challenge"], entry["code_challenge_method"]
+    ):
+        return JSONResponse(
+            {"error": "invalid_grant", "error_description": "PKCE mismatch"},
+            status_code=400,
+        )
+
+    token = secrets.token_urlsafe(48)
+    _access_tokens[token] = {"client_id": client_id, "expires_at": time.time() + TOKEN_TTL}
+    log.info("OAuth: issued access token for client %r", client_id)
+    return JSONResponse({
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": TOKEN_TTL,
+    })
+
 
 # CalDAV helpers
 
@@ -143,23 +323,14 @@ def _to_iso(o) -> Optional[str]:
 
 
 def _parse_iso_or_default(value: Optional[str], fallback: dt.datetime) -> dt.datetime:
-    """Parse an ISO datetime string or return the fallback if missing.
-
-    This mirrors ``_parse_iso`` semantics but handles ``None`` by
-    returning ``fallback``. Non-empty strings that fail to parse will
-    still raise, preserving the original behavior.
-    """
+    """Parse an ISO datetime string or return the fallback if missing."""
     if value is None:
         return fallback
     return _parse_iso(value)
 
 
 def _normalize_to_tz(ts: dt.datetime, tzid: str) -> dt.datetime:
-    """Return ``ts`` normalized into the given IANA timezone.
-
-    Naive datetimes are treated as wall time in ``tzid``; aware
-    datetimes are converted.
-    """
+    """Return ``ts`` normalized into the given IANA timezone."""
     tz = ZoneInfo(tzid)
     if ts.tzinfo is None:
         return ts.replace(tzinfo=tz)
@@ -178,11 +349,7 @@ def _build_vevent_ics(
     *,
     include_location: bool,
 ) -> str:
-    """Build a minimal VEVENT ICS blob.
-
-    The resulting text matches the layout used by ``create_event`` and
-    ``update_event`` so existing behavior is preserved.
-    """
+    """Build a minimal VEVENT ICS blob."""
     lines: List[str] = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -209,26 +376,7 @@ def _build_rrule(
     tzid: str,
     dtstart: Optional[dt.datetime] = None,
 ) -> Optional[str]:
-    """
-    Build an RFC5545 RRULE value from a high-level recurrence dict.
-
-    recurrence:
-      {
-        "frequency": "daily" | "weekly" | "monthly" | "yearly" | "custom",
-        "interval": int (default 1),
-        "by_weekday": ["MO","TU",...],      # optional, for weekly/custom
-        "by_monthday": [1,15,...],         # optional, for monthly/custom
-        "end": {
-          "type": "on_date",               # UNTIL
-          "date": "YYYY-MM-DD" | ISO dt
-          # or
-          # "type": "after_occurrences",   # COUNT
-          # "count": int
-        },
-        # for frequency == "custom":
-        # "rrule": "FREQ=...;BYDAY=...;..."
-      }
-    """
+    """Build an RFC5545 RRULE value from a high-level recurrence dict."""
     if not recurrence:
         return None
 
@@ -236,7 +384,6 @@ def _build_rrule(
     if not freq:
         return None
 
-    # Custom raw RRULE passthrough
     if freq == "custom":
         raw = recurrence.get("rrule")
         return str(raw).strip() if raw else None
@@ -261,7 +408,6 @@ def _build_rrule(
         days = [str(d).upper() for d in by_weekday]
         parts.append(f"BYDAY={','.join(days)}")
     elif freq == "weekly" and dtstart is not None:
-        # Default weekly: same weekday as dtstart
         weekday_map = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
         parts.append(f"BYDAY={weekday_map[dtstart.weekday()]}")
 
@@ -275,7 +421,6 @@ def _build_rrule(
     if end_type == "on_date":
         date_str = end.get("date")
         if date_str:
-            # Interpret as local in tzid, convert to UTC, format as UNTIL=...Z
             try:
                 if len(date_str) == 10:
                     y, m, d = map(int, date_str.split("-"))
@@ -288,7 +433,6 @@ def _build_rrule(
                 until_str = until_utc.strftime("%Y%m%dT%H%M%SZ")
                 parts.append(f"UNTIL={until_str}")
             except Exception:
-                # If parsing fails, skip UNTIL
                 pass
     elif end_type == "after_occurrences":
         count = end.get("count")
@@ -305,9 +449,6 @@ if DR_ONLY:
         """
         Read-only search across SUMMARY and DESCRIPTION within a time window.
         Returns [{ id, title, snippet }]
-        - id: "{calendar_url}|{uid}"
-        - title: SUMMARY
-        - snippet: ISO start + calendar name
         """
         q = (query or "").strip().lower()
         if not q:
@@ -318,7 +459,6 @@ if DR_ONLY:
         rows: List[Dict[str, Any]] = []
         for cal in _all_calendars():
             calname = getattr(cal, "name", None) or str(cal.url)
-            # expand=True to surface recurring instances as separate hits
             for ev in cal.search(event=True, start=start, end=end, expand=True):
                 comp = ev.component
                 summary = str(comp.get("summary", "") or "")
@@ -355,7 +495,6 @@ if DR_ONLY:
             if not cal:
                 continue
             found_raw = None
-            # expand=False to get the series VEVENT ICS blob
             for ev in cal.search(event=True, start=start, end=end, expand=False):
                 comp = ev.component
                 if str(comp.get("uid", "") or "").strip() == uid:
@@ -374,9 +513,7 @@ if not DR_ONLY:
 
     @mcp.tool()
     def list_calendars() -> List[Dict[str, Any]]:
-        """
-        Return available calendar containers with their name and URL.
-        """
+        """Return available calendar containers with their name and URL."""
         calendars = _all_calendars()
         out: List[Dict[str, Any]] = []
         for calendar in calendars:
@@ -396,11 +533,7 @@ if not DR_ONLY:
         expand_recurring: bool = True,
     ) -> List[Dict[str, Any]]:
         """
-        Return calendars that have at least one event between ISO datetimes
-        [start, end).
-
-        Each item mirrors ``list_calendars`` but is filtered to only those
-        calendars that contain at least one matching event in the range.
+        Return calendars that have at least one event between ISO datetimes [start, end).
         """
         s = _parse_iso(start)
         e = _parse_iso(end)
@@ -436,10 +569,7 @@ if not DR_ONLY:
         end: str,
         expand_recurring: bool = True,
     ) -> List[Dict[str, Any]]:
-        """
-        List events between ISO datetimes [start, end).
-        calendar_name_or_url: either display name or absolute CalDAV URL.
-        """
+        """List events between ISO datetimes [start, end)."""
         s = _parse_iso(start)
         e = _parse_iso(end)
         cal = _resolve_calendar(calendar_name_or_url)
@@ -447,7 +577,7 @@ if not DR_ONLY:
         events = cal.search(event=True, start=s, end=e, expand=expand_recurring)
         out: List[Dict[str, Any]] = []
         for ev in events:
-            comp = ev.component  # icalendar.Event
+            comp = ev.component
             summary = str(comp.get("summary", "")) if comp.get("summary") is not None else ""
             dtstart = comp.decoded("dtstart")
             dtend   = comp.decoded("dtend", default=None)
@@ -458,7 +588,7 @@ if not DR_ONLY:
                 "summary": summary,
                 "start": dtstart.isoformat() if hasattr(dtstart, "isoformat") else str(dtstart),
                 "end":   dtend.isoformat() if (dtend and hasattr(dtend, "isoformat")) else (str(dtend) if dtend else None),
-                "raw": ev.data,  # original ICS text
+                "raw": ev.data,
             })
         return out
 
@@ -473,29 +603,7 @@ if not DR_ONLY:
         location: Optional[str] = None,
         recurrence: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """
-        Create an event in the given calendar.
-
-        start/end: ISO datetimes, local or '...Z' for UTC.
-        tzid:     IANA TZ name (e.g., 'America/New_York'); used if times are naive.
-        recurrence: optional dict, e.g.:
-
-          {
-            "frequency": "daily" | "weekly" | "monthly" | "yearly" | "custom",
-            "interval": 1,
-            "by_weekday": ["MO","WE"],
-            "by_monthday": [1,15],
-            "end": {
-              "type": "on_date",           # or "after_occurrences"
-              "date": "2025-12-31",       # for on_date
-              # or:
-              # "type": "after_occurrences",
-              # "count": 10
-            },
-            # for custom:
-            # "rrule": "FREQ=MONTHLY;BYDAY=MO,TU;BYSETPOS=1"
-          }
-        """
+        """Create an event in the given calendar."""
         tzid = tzid or DEFAULT_TZID
 
         s = _normalize_to_tz(_parse_iso(start), tzid)
@@ -526,26 +634,19 @@ if not DR_ONLY:
         calendar_name_or_url: str,
         uid: str,
         summary: Optional[str] = None,
-        start: Optional[str] = None,   # ISO datetime
-        end: Optional[str] = None,     # ISO datetime
+        start: Optional[str] = None,
+        end: Optional[str] = None,
         tzid: Optional[str] = None,
         description: Optional[str] = None,
         location: Optional[str] = None,
         recurrence: Optional[Dict[str, Any]] = None,
         clear_recurrence: bool = False,
     ) -> bool:
-        """
-        Update a VEVENT identified by UID.
-
-        - If recurrence is provided, replaces existing RRULE.
-        - If clear_recurrence is True, removes any RRULE.
-        - If neither is provided, preserves existing RRULE.
-        """
+        """Update a VEVENT identified by UID."""
         tzid = tzid or DEFAULT_TZID
 
         cal = _resolve_calendar(calendar_name_or_url)
 
-        # Search wide window for matching UID
         s_window, e_window = _uid_search_window()
 
         target = None
@@ -564,7 +665,6 @@ if not DR_ONLY:
         old_dtstart = comp.decoded("dtstart")
         old_dtend   = comp.decoded("dtend", default=None)
 
-        # Existing RRULE, if any
         old_rrule_str: Optional[str] = None
         try:
             old_rrule_prop = comp.get("rrule")
@@ -586,11 +686,9 @@ if not DR_ONLY:
         new_end_fallback = old_dtend if old_dtend is not None else (new_start + dt.timedelta(hours=1))
         new_end     = _parse_iso_or_default(end, new_end_fallback)
 
-        # Normalize updated times into the requested/default TZID
         new_start = _normalize_to_tz(new_start, tzid)
         new_end = _normalize_to_tz(new_end, tzid)
 
-        # Decide final RRULE
         if clear_recurrence:
             effective_rrule: Optional[str] = None
         elif recurrence is not None:
@@ -616,10 +714,7 @@ if not DR_ONLY:
 
     @mcp.tool()
     def delete_event(calendar_name_or_url: str, uid: str) -> bool:
-        """
-        Delete a VEVENT by UID from the given calendar.
-        Returns True if deleted, else False (not found).
-        """
+        """Delete a VEVENT by UID from the given calendar."""
         cal = _resolve_calendar(calendar_name_or_url)
 
         start, end = _uid_search_window()
@@ -634,6 +729,24 @@ if not DR_ONLY:
 # Main
 
 if __name__ == "__main__":
-    log.info("Starting MCP HTTP server on %s:%s", SERVER_HOST, SERVER_PORT)
-    log.info("CalDAV: %s  Apple ID: %r  TZ: %s  DR_ONLY=%s", CALDAV_URL, APPLE_ID, DEFAULT_TZID, DR_ONLY)
-    mcp.run(transport="http", host=SERVER_HOST, port=SERVER_PORT, path="/mcp")
+    import uvicorn
+
+    log.info(
+        "Starting MCP HTTP server on %s:%s  OAuth=%s",
+        SERVER_HOST, SERVER_PORT, OAUTH_ENABLED,
+    )
+    log.info(
+        "CalDAV: %s  Apple ID: %r  TZ: %s  DR_ONLY=%s",
+        CALDAV_URL, APPLE_ID, DEFAULT_TZID, DR_ONLY,
+    )
+
+    # Obtain the Starlette ASGI app from FastMCP so we can attach middleware
+    app = mcp.http_app(path="/mcp")
+
+    if OAUTH_ENABLED:
+        app.add_middleware(_BearerAuthMiddleware)
+        log.info("OAuth enabled — /mcp requires Bearer token (client_id=%r)", OAUTH_CLIENT_ID)
+    else:
+        log.warning("OAuth is DISABLED — /mcp is publicly accessible. Set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET to enable auth.")
+
+    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
