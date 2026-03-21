@@ -2,9 +2,7 @@
 
 An HTTP **Model Context Protocol (MCP)** server exposing iCloud services to MCP-aware clients (e.g., ChatGPT custom connectors, IDEs) using an iCloud **app-specific password**.
 
-**Currently supported:** iCloud Calendar (CalDAV) — list calendars, read events, create/update/delete events.
-
-**Planned:** iCloud Mail (IMAP/SMTP).
+**Supported:** iCloud Calendar (CalDAV) + iCloud Mail (IMAP/SMTP).
 
 > Unofficial. Keep this service private; it forwards your iCloud app-specific password to Apple’s servers.
 
@@ -19,16 +17,24 @@ I built this to use in ChatGPT Custom Connector, so I can change my iCloud Calen
 ## Features
 
 - HTTP MCP server (`/mcp`) + `GET /health`
-- Tools (default write-capable profile):
+- **Calendar tools** (default write-capable profile):
   - `list_calendars()`
   - `list_calendars_with_events(start, end, expand_recurring=True)`
   - `list_events(calendar_name_or_url, start, end, expand_recurring=True)`
   - `create_event(calendar_name_or_url, summary, start, end, tzid?, description?, location?, recurrence?)`
   - `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?, recurrence?, clear_recurrence=False)`
   - `delete_event(calendar_name_or_url, uid)`
-- Tools (Deep Research read-only profile):
+- **Calendar tools** (Deep Research read-only profile, `DR_PROFILE=1`):
   - `search(query)` → basic text search over SUMMARY/DESCRIPTION in a time window
   - `fetch(ids)` → fetch raw `text/calendar` ICS blobs for search results
+- **Mail tools** (opt-in, `MAIL_ENABLED=1`):
+  - `list_mailboxes()` — list all folders
+  - `list_messages(mailbox, limit, unread_only)` — list messages with headers
+  - `get_message(uid, mailbox)` — fetch full message with body
+  - `search_messages(query, mailbox, limit)` — IMAP TEXT search
+  - `send_message(to, subject, body, cc?, bcc?)` — send via SMTP
+  - `delete_message(uid, mailbox)` — move to Trash
+  - `mark_message(uid, mailbox, read)` — mark read/unread
 - ISO datetime input (`YYYY-MM-DDTHH:MM:SS`, with optional `Z` or timezone offset)
 - Minimal ICS generation (summary/description escaping), UID matching across a ±3-year window
 
@@ -38,8 +44,8 @@ I built this to use in ChatGPT Custom Connector, so I can change my iCloud Calen
 
 - Python **3.11+**
 - Apple ID (**email** identity, not phone number)
-- iCloud **app-specific password** (revocable)
-- Network access to `https://caldav.icloud.com`
+- iCloud **app-specific password** (revocable) — one password works for both calendar and mail
+- Network access to `https://caldav.icloud.com`, `imap.mail.me.com`, `smtp.mail.me.com`
 
 ---
 
@@ -49,15 +55,23 @@ Create a `.env` **next to** `server.py` (auto-loaded):
 
 ```env
 APPLE_ID=you@example.com                 # Use your Apple ID email
-ICLOUD_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx  # App-specific password
+ICLOUD_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx  # App-specific password (works for both calendar and mail)
 CALDAV_URL=https://caldav.icloud.com     # optional, default shown
 HOST=127.0.0.1                           # optional
 PORT=8000                                # optional
 TZID=America/New_York                    # default TZ for new/edited events
 
-# Deep Research: read-only profile (optional)
+# Deep Research: read-only calendar profile (optional)
 DR_PROFILE=0                             # Set to 1 to enable DR mode (default 0)
 SCAN_DAYS=1095                           # Time window (days) scanned by DR search/fetch (default ~3 years)
+
+# Mail (IMAP / SMTP) — optional, disabled by default
+MAIL_ENABLED=1                           # Set to 1 to enable mail tools
+IMAP_HOST=imap.mail.me.com              # optional, default shown
+IMAP_PORT=993                            # optional, default shown
+SMTP_HOST=smtp.mail.me.com              # optional, default shown
+SMTP_PORT=587                            # optional, default shown
+ICLOUD_TRASH_FOLDER=Deleted Messages     # optional, iCloud trash folder name
 ```
 
 Required: `APPLE_ID`, `ICLOUD_APP_PASSWORD`.
@@ -175,6 +189,42 @@ Deletes the first matching `uid` in a ±3-year window.
 - New/edited events emit `DTSTART;TZID=...` and `DTEND;TZID=...` using provided `tzid` or `TZID` env
 - Updates attempt to reuse the original TZID when present
 - `LOCATION` is emitted when `location` is provided and non-empty; passing an empty string when updating an event removes the existing location.
+
+---
+
+## Mail Tool Reference
+
+Enable with `MAIL_ENABLED=1`. Uses the same `APPLE_ID` and `ICLOUD_APP_PASSWORD` as the calendar. No extra dependencies — pure Python stdlib (`imaplib`, `smtplib`).
+
+### `list_mailboxes() -> List[{name}]`
+
+Returns all IMAP folders (INBOX, Sent, Drafts, Junk, Deleted Messages, etc.).
+
+### `list_messages(mailbox="INBOX", limit=20, unread_only=False) -> List[Message]`
+
+Returns newest-first headers for up to `limit` messages. Each item:
+- `uid: str`, `subject: str`, `from: str`, `date: str`, `read: bool`
+
+### `get_message(uid, mailbox="INBOX") -> Message`
+
+Fetches the full message including decoded body (`text/plain` preferred, HTML stripped as fallback). Returns:
+- `uid, subject, from, to, cc, date, body, read`
+
+### `search_messages(query, mailbox="INBOX", limit=20) -> List[Message]`
+
+IMAP `TEXT` search — matches subject and body. Returns same header fields as `list_messages`.
+
+### `send_message(to, subject, body, cc=None, bcc=None) -> bool`
+
+Sends via SMTP (STARTTLS on port 587). `to` and `cc` may be comma-separated. Returns `True` on success.
+
+### `delete_message(uid, mailbox="INBOX") -> bool`
+
+Copies to Trash (`Deleted Messages` by default, override with `ICLOUD_TRASH_FOLDER`) then expunges. Returns `True` on success.
+
+### `mark_message(uid, mailbox="INBOX", read=True) -> bool`
+
+Sets or clears the `\Seen` flag. Returns `True` on success.
 
 ---
 

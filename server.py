@@ -11,6 +11,13 @@ import hashlib
 import base64
 import time
 import html as html_lib
+import imaplib
+import smtplib
+import re
+import email as _email_mod
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.header import decode_header as _decode_rfc2047
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from zoneinfo import ZoneInfo
@@ -49,6 +56,14 @@ SERVER_PORT = int(os.environ.get("PORT", "8000"))
 # Add DR profile + scan window
 DR_ONLY = os.environ.get("DR_PROFILE", "0") == "1"
 SCAN_DAYS = int(os.environ.get("SCAN_DAYS", str(LOOKBACK_YEARS * 365)))
+
+# Mail (IMAP / SMTP) — set MAIL_ENABLED=1 to activate mail tools
+MAIL_ENABLED    = os.environ.get("MAIL_ENABLED", "0") == "1"
+IMAP_HOST       = os.environ.get("IMAP_HOST", "imap.mail.me.com").strip()
+IMAP_PORT       = int(os.environ.get("IMAP_PORT", "993"))
+SMTP_HOST       = os.environ.get("SMTP_HOST", "smtp.mail.me.com").strip()
+SMTP_PORT       = int(os.environ.get("SMTP_PORT", "587"))
+ICLOUD_TRASH    = os.environ.get("ICLOUD_TRASH_FOLDER", "Deleted Messages")
 
 # OAuth config — if both vars are set, Bearer-token auth is enforced on /mcp
 OAUTH_CLIENT_ID     = os.environ.get("OAUTH_CLIENT_ID", "").strip()
@@ -441,6 +456,322 @@ def _build_rrule(
 
     return ";".join(parts) if parts else None
 
+# ── Mail helpers ──────────────────────────────────────────────────────────────
+
+def _imap() -> imaplib.IMAP4_SSL:
+    """Return a new authenticated IMAP connection (stateless — one per call)."""
+    conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+    conn.login(APPLE_ID, APP_PW)
+    return conn
+
+
+def _decode_header(value: str) -> str:
+    """Decode an RFC 2047-encoded mail header value to plain Unicode."""
+    parts = _decode_rfc2047(value or "")
+    out = []
+    for raw, charset in parts:
+        if isinstance(raw, bytes):
+            out.append(raw.decode(charset or "utf-8", errors="replace"))
+        else:
+            out.append(str(raw))
+    return "".join(out)
+
+
+def _extract_body(msg: _email_mod.message.Message) -> str:
+    """Extract the best plain-text body from an email.Message."""
+    if msg.is_multipart():
+        plain = None
+        html = None
+        for part in msg.walk():
+            ct = part.get_content_type()
+            cd = str(part.get("Content-Disposition", ""))
+            if "attachment" in cd:
+                continue
+            if ct == "text/plain" and plain is None:
+                charset = part.get_content_charset() or "utf-8"
+                payload = part.get_payload(decode=True)
+                if payload:
+                    plain = payload.decode(charset, errors="replace")
+            elif ct == "text/html" and html is None:
+                charset = part.get_content_charset() or "utf-8"
+                payload = part.get_payload(decode=True)
+                if payload:
+                    html = payload.decode(charset, errors="replace")
+        if plain is not None:
+            return plain
+        if html is not None:
+            return re.sub(r"<[^>]+>", "", html)
+        return ""
+    else:
+        charset = msg.get_content_charset() or "utf-8"
+        payload = msg.get_payload(decode=True)
+        return payload.decode(charset, errors="replace") if payload else ""
+
+
+def _uid_from_meta(meta: bytes) -> str:
+    """Extract UID integer from an IMAP FETCH response metadata line."""
+    m = re.search(rb"\bUID\s+(\d+)\b", meta, re.IGNORECASE)
+    return m.group(1).decode() if m else "?"
+
+
+def _flags_from_meta(meta: bytes) -> List[str]:
+    """Extract flag names (e.g. 'Seen', 'Flagged') from FETCH metadata."""
+    m = re.search(rb"FLAGS\s+\(([^)]*)\)", meta, re.IGNORECASE)
+    if not m:
+        return []
+    return [f.decode().lstrip("\\") for f in m.group(1).split()]
+
+
+# ── Mail MCP tools ─────────────────────────────────────────────────────────────
+
+if MAIL_ENABLED:
+
+    @mcp.tool()
+    def list_mailboxes() -> List[Dict[str, Any]]:
+        """List all iCloud Mail mailboxes (folders)."""
+        conn = _imap()
+        try:
+            status, data = conn.list()
+            if status != "OK":
+                return []
+            out = []
+            for item in data:
+                if not item:
+                    continue
+                line = item.decode() if isinstance(item, bytes) else str(item)
+                # Format: (\Flags) "delimiter" "Name"  or  (\Flags) "delimiter" Name
+                m = re.search(r'"([^"]+)"\s*$', line)
+                if not m:
+                    m = re.search(r'\s(\S+)\s*$', line)
+                name = m.group(1) if m else line.strip()
+                out.append({"name": name})
+            return out
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    @mcp.tool()
+    def list_messages(
+        mailbox: str = "INBOX",
+        limit: int = 20,
+        unread_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        List recent messages in a mailbox with headers.
+        Returns [{uid, subject, from, date, read}] newest-first.
+        """
+        conn = _imap()
+        try:
+            conn.select(f'"{mailbox}"', readonly=True)
+            criteria = "UNSEEN" if unread_only else "ALL"
+            status, data = conn.uid("SEARCH", None, criteria)
+            if status != "OK" or not data or not data[0]:
+                return []
+            uids = data[0].split()
+            uids = uids[-limit:][::-1]  # newest first, capped at limit
+            if not uids:
+                return []
+            uid_list = b",".join(uids)
+            status, fetch_data = conn.uid(
+                "FETCH", uid_list,
+                "(FLAGS BODY[HEADER.FIELDS (FROM SUBJECT DATE)])"
+            )
+            if status != "OK":
+                return []
+            out = []
+            for item in fetch_data:
+                if not isinstance(item, tuple) or len(item) != 2:
+                    continue
+                meta, header_bytes = item
+                if not isinstance(meta, bytes):
+                    meta = str(meta).encode()
+                uid_val = _uid_from_meta(meta)
+                flags = _flags_from_meta(meta)
+                msg = _email_mod.message_from_bytes(header_bytes)
+                out.append({
+                    "uid": uid_val,
+                    "subject": _decode_header(msg.get("Subject", "")),
+                    "from": _decode_header(msg.get("From", "")),
+                    "date": msg.get("Date", ""),
+                    "read": "Seen" in flags,
+                })
+            return out
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    @mcp.tool()
+    def get_message(uid: str, mailbox: str = "INBOX") -> Dict[str, Any]:
+        """
+        Fetch a full message by UID.
+        Returns {uid, subject, from, to, cc, date, body, read}.
+        """
+        conn = _imap()
+        try:
+            conn.select(f'"{mailbox}"', readonly=True)
+            status, data = conn.uid("FETCH", uid.encode(), "(FLAGS RFC822)")
+            if status != "OK" or not data or data[0] is None:
+                return {"error": f"Message UID {uid} not found in {mailbox}"}
+            for item in data:
+                if not isinstance(item, tuple) or len(item) != 2:
+                    continue
+                meta, raw = item
+                if not isinstance(meta, bytes):
+                    meta = str(meta).encode()
+                flags = _flags_from_meta(meta)
+                msg = _email_mod.message_from_bytes(raw)
+                return {
+                    "uid": uid,
+                    "subject": _decode_header(msg.get("Subject", "")),
+                    "from": _decode_header(msg.get("From", "")),
+                    "to": _decode_header(msg.get("To", "")),
+                    "cc": _decode_header(msg.get("Cc", "")),
+                    "date": msg.get("Date", ""),
+                    "body": _extract_body(msg),
+                    "read": "Seen" in flags,
+                }
+            return {"error": f"Message UID {uid} not found"}
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    @mcp.tool()
+    def search_messages(
+        query: str,
+        mailbox: str = "INBOX",
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search messages by text (subject + body).
+        Returns [{uid, subject, from, date}] newest-first.
+        """
+        conn = _imap()
+        try:
+            conn.select(f'"{mailbox}"', readonly=True)
+            status, data = conn.uid("SEARCH", None, f'TEXT "{query}"')
+            if status != "OK" or not data or not data[0]:
+                return []
+            uids = data[0].split()[-limit:][::-1]
+            if not uids:
+                return []
+            uid_list = b",".join(uids)
+            status, fetch_data = conn.uid(
+                "FETCH", uid_list,
+                "(BODY[HEADER.FIELDS (FROM SUBJECT DATE)])"
+            )
+            if status != "OK":
+                return []
+            out = []
+            for item in fetch_data:
+                if not isinstance(item, tuple) or len(item) != 2:
+                    continue
+                meta, header_bytes = item
+                if not isinstance(meta, bytes):
+                    meta = str(meta).encode()
+                uid_val = _uid_from_meta(meta)
+                msg = _email_mod.message_from_bytes(header_bytes)
+                out.append({
+                    "uid": uid_val,
+                    "subject": _decode_header(msg.get("Subject", "")),
+                    "from": _decode_header(msg.get("From", "")),
+                    "date": msg.get("Date", ""),
+                })
+            return out
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    @mcp.tool()
+    def send_message(
+        to: str,
+        subject: str,
+        body: str,
+        cc: Optional[str] = None,
+        bcc: Optional[str] = None,
+    ) -> bool:
+        """
+        Send an email via iCloud SMTP. `to` and `cc` may be comma-separated.
+        Returns True on success.
+        """
+        msg = MIMEMultipart()
+        msg["From"] = APPLE_ID
+        msg["To"] = to
+        msg["Subject"] = subject
+        if cc:
+            msg["Cc"] = cc
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        recipients = [a.strip() for a in to.split(",")]
+        if cc:
+            recipients += [a.strip() for a in cc.split(",")]
+        if bcc:
+            recipients += [a.strip() for a in bcc.split(",")]
+
+        try:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as conn:
+                conn.ehlo()
+                conn.starttls()
+                conn.login(APPLE_ID, APP_PW)
+                conn.sendmail(APPLE_ID, recipients, msg.as_bytes())
+            log.info("SMTP: sent message to %s", to)
+            return True
+        except Exception as exc:
+            log.error("SMTP send failed: %s", exc)
+            return False
+
+    @mcp.tool()
+    def delete_message(uid: str, mailbox: str = "INBOX") -> bool:
+        """
+        Move a message to Trash by UID. Returns True on success.
+        The trash folder name can be overridden via ICLOUD_TRASH_FOLDER env var
+        (default: "Deleted Messages").
+        """
+        conn = _imap()
+        try:
+            conn.select(f'"{mailbox}"')
+            try:
+                conn.uid("COPY", uid.encode(), f'"{ICLOUD_TRASH}"')
+            except Exception:
+                pass  # if copy fails, still mark deleted below
+            conn.uid("STORE", uid.encode(), "+FLAGS", "\\Deleted")
+            conn.expunge()
+            return True
+        except Exception as exc:
+            log.error("delete_message failed: %s", exc)
+            return False
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    @mcp.tool()
+    def mark_message(uid: str, mailbox: str = "INBOX", read: bool = True) -> bool:
+        """Mark a message as read (read=True) or unread (read=False). Returns True on success."""
+        conn = _imap()
+        try:
+            conn.select(f'"{mailbox}"')
+            flag_op = "+FLAGS" if read else "-FLAGS"
+            status, _ = conn.uid("STORE", uid.encode(), flag_op, "\\Seen")
+            return status == "OK"
+        except Exception as exc:
+            log.error("mark_message failed: %s", exc)
+            return False
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+
 # DR profile: read-only search/fetch
 if DR_ONLY:
 
@@ -736,9 +1067,11 @@ if __name__ == "__main__":
         SERVER_HOST, SERVER_PORT, OAUTH_ENABLED,
     )
     log.info(
-        "CalDAV: %s  Apple ID: %r  TZ: %s  DR_ONLY=%s",
-        CALDAV_URL, APPLE_ID, DEFAULT_TZID, DR_ONLY,
+        "CalDAV: %s  Apple ID: %r  TZ: %s  DR_ONLY=%s  MAIL=%s",
+        CALDAV_URL, APPLE_ID, DEFAULT_TZID, DR_ONLY, MAIL_ENABLED,
     )
+    if MAIL_ENABLED:
+        log.info("Mail: IMAP=%s:%s  SMTP=%s:%s", IMAP_HOST, IMAP_PORT, SMTP_HOST, SMTP_PORT)
 
     # Obtain the Starlette ASGI app from FastMCP so we can attach middleware
     app = mcp.http_app(path="/mcp")
