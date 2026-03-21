@@ -1,8 +1,12 @@
-# iCloud CalDAV MCP Connector
+# iCloud MCP Connector
 
-An HTTP **Model Context Protocol (MCP)** server exposing iCloud Calendar (CalDAV) tools so MCP-aware clients (e.g., ChatGPT custom connectors, IDEs) can list calendars, read events, and create/update/delete events using an iCloud **app-specific password**.
+An HTTP **Model Context Protocol (MCP)** server exposing iCloud services to MCP-aware clients (e.g., ChatGPT custom connectors, IDEs) using an iCloud **app-specific password**.
 
-> Unofficial. Calendar only. Keep this service private; it forwards your iCloud app-specific password to Apple’s CalDAV endpoint.
+**Currently supported:** iCloud Calendar (CalDAV) — list calendars, read events, create/update/delete events.
+
+**Planned:** iCloud Mail (IMAP/SMTP).
+
+> Unofficial. Keep this service private; it forwards your iCloud app-specific password to Apple’s servers.
 
 ---
 
