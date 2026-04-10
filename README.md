@@ -1,6 +1,6 @@
 # iCloud MCP Connector
 
-An HTTP **Model Context Protocol (MCP)** server exposing iCloud services to MCP-aware clients (e.g., ChatGPT custom connectors, IDEs) using an iCloud **app-specific password**.
+An HTTP **Model Context Protocol (MCP)** server exposing iCloud services to MCP-aware clients (e.g., claude custom connectors, IDEs) using an iCloud **app-specific password**.
 
 **Supported:** iCloud Calendar (CalDAV) + iCloud Mail (IMAP/SMTP).
 
@@ -10,7 +10,7 @@ An HTTP **Model Context Protocol (MCP)** server exposing iCloud services to MCP-
 
 ## Why did I build this?
 
-I built this to use in ChatGPT Custom Connector, so I can change my iCloud Calendar compared to changing it manually. Came up with this idea on a Friday night before a TOP Pset was due, and this turned out to be a fun 1-day project.
+I built this to use in Claude Custom Connector, so I can change my iCloud Calendar compared to changing it manually. Came up with this idea on a Friday night before a TOP Pset was due, and this turned out to be a fun 1-day project.
 
 ---
 
@@ -159,7 +159,7 @@ Creates a minimal **VEVENT**.
     }
     ```
 
-- Returns the generated `uid` (random hex + `@chatgpt-mcp`).
+- Returns the generated `uid` (random hex + `@claude-mcp`).
 
 ### `update_event(calendar_name_or_url, uid, summary?, start?, end?, tzid?, description?, location?, recurrence?, clear_recurrence=False) -> bool`
 
@@ -294,7 +294,7 @@ asyncio.run(main())
 
 ## Deployment / Public HTTPS
 
-To use this with ChatGPT Custom Connectors you need a public HTTPS endpoint that forwards to your local server.
+To use this with claude Custom Connectors you need a public HTTPS endpoint that forwards to your local server.
 
 See [DEPLOY.md](./DEPLOY.md) for:
 
