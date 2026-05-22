@@ -189,6 +189,9 @@ test_server.py
 *.log
 docker-compose.override.yml
 
+# Event extractor database
+event_extractor.db
+
 # OS-specific
 .DS_Store
 Thumbs.db

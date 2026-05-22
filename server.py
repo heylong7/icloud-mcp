@@ -24,6 +24,12 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+
+# Event extraction
+from event_extractor.config import get_provider_config
+from event_extractor.provider_factory import get_provider
+from event_extractor.extractor import extract_and_sync
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, JSONResponse, HTMLResponse, RedirectResponse
@@ -765,6 +771,94 @@ if MAIL_ENABLED:
         except Exception as exc:
             log.error("mark_message failed: %s", exc)
             return False
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    @mcp.tool()
+    def extract_events_from_emails(
+        mailbox: str = "INBOX",
+        limit: int = 50,
+        since_days: int = 3,
+        auto_create: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Fetch unread emails and extract time-sensitive events via LLM.
+
+        Parameters:
+        - mailbox: Mailbox to scan (default "INBOX")
+        - limit: Max number of unread emails to process (default 50)
+        - since_days: Only process emails from the last N days (default 3)
+        - auto_create: If True, explicit-time events are auto-created in iCloud Calendar
+
+        Returns:
+            {
+                "explicit": [...],        # events with clear dates/times
+                "vague": [...],           # events with implied timing (pending confirmation)
+                "total_emails_scanned": int,
+                "new_emails_processed": int,
+                "auto_created": int,
+            }
+        """
+        conn = _imap()
+        try:
+            conn.select(f'"{mailbox}"', readonly=True)
+            status, data = conn.uid("SEARCH", None, "UNSEEN")
+            if status != "OK" or not data or not data[0]:
+                return {
+                    "explicit": [], "vague": [],
+                    "total_emails_scanned": 0, "new_emails_processed": 0, "auto_created": 0,
+                }
+
+            uids = data[0].split()
+            uids = uids[-limit:][::-1]
+            if not uids:
+                return {
+                    "explicit": [], "vague": [],
+                    "total_emails_scanned": 0, "new_emails_processed": 0, "auto_created": 0,
+                }
+
+            emails = []
+            for uid_b in uids:
+                status, fetch_data = conn.uid("FETCH", uid_b, "(FLAGS RFC822)")
+                if status != "OK":
+                    continue
+                for item in fetch_data:
+                    if not isinstance(item, tuple) or len(item) != 2:
+                        continue
+                    meta, raw = item
+                    if not isinstance(meta, bytes):
+                        meta = str(meta).encode()
+                    flags = _flags_from_meta(meta)
+                    if "Seen" in flags:
+                        continue
+                    msg = _email_mod.message_from_bytes(raw)
+                    emails.append({
+                        "uid": _uid_from_meta(meta),
+                        "subject": _decode_header(msg.get("Subject", "")),
+                        "from": _decode_header(msg.get("From", "")),
+                        "date": msg.get("Date", ""),
+                        "body": _extract_body(msg),
+                        "read": False,
+                    })
+
+            if not emails:
+                return {
+                    "explicit": [], "vague": [],
+                    "total_emails_scanned": 0, "new_emails_processed": 0, "auto_created": 0,
+                }
+
+            config = get_provider_config()
+            provider = get_provider(config)
+            result = extract_and_sync(
+                provider=provider,
+                emails=emails,
+                auto_create=auto_create,
+                dedup_db_path=str(Path(__file__).parent / "event_extractor.db"),
+            )
+            return result
         finally:
             try:
                 conn.logout()
