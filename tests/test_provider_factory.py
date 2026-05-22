@@ -13,7 +13,7 @@ class TestGetProvider:
         config = {
             "provider": "deepseek",
             "api_key": "sk-test",
-            "base_url": "https://api.deepseek.com",
+            "base_url": "https://platform.deepseek.com",
             "model": "deepseek-chat",
         }
         provider = get_provider(config)

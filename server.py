@@ -105,6 +105,15 @@ def _verify_pkce(verifier: str, challenge: str, method: str) -> bool:
     return False
 
 
+class _HealthCheckMiddleware(BaseHTTPMiddleware):
+    """Intercept GET /mcp health checks so MCP health probes see 200 instead of 406."""
+
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "GET" and request.url.path == "/mcp":
+            return PlainTextResponse("OK")
+        return await call_next(request)
+
+
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
     """Require a valid Bearer token on /mcp when OAuth is enabled."""
     _SKIP = {"/.well-known/oauth-authorization-server", "/authorize", "/token", "/health"}
@@ -619,7 +628,7 @@ if MAIL_ENABLED:
         conn = _imap()
         try:
             conn.select(f'"{mailbox}"', readonly=True)
-            status, data = conn.uid("FETCH", uid.encode(), "(FLAGS RFC822)")
+            status, data = conn.uid("FETCH", uid.encode(), "(FLAGS BODY[])")
             if status != "OK" or not data or data[0] is None:
                 return {"error": f"Message UID {uid} not found in {mailbox}"}
             for item in data:
@@ -805,7 +814,8 @@ if MAIL_ENABLED:
         conn = _imap()
         try:
             conn.select(f'"{mailbox}"', readonly=True)
-            status, data = conn.uid("SEARCH", None, "UNSEEN")
+            since_date = (dt.datetime.now() - dt.timedelta(days=since_days)).strftime("%d-%b-%Y")
+            status, data = conn.uid("SEARCH", None, f"SINCE {since_date}")
             if status != "OK" or not data or not data[0]:
                 return {
                     "explicit": [], "vague": [],
@@ -822,7 +832,7 @@ if MAIL_ENABLED:
 
             emails = []
             for uid_b in uids:
-                status, fetch_data = conn.uid("FETCH", uid_b, "(FLAGS RFC822)")
+                status, fetch_data = conn.uid("FETCH", uid_b, "(FLAGS BODY[])")
                 if status != "OK":
                     continue
                 for item in fetch_data:
@@ -832,8 +842,6 @@ if MAIL_ENABLED:
                     if not isinstance(meta, bytes):
                         meta = str(meta).encode()
                     flags = _flags_from_meta(meta)
-                    if "Seen" in flags:
-                        continue
                     msg = _email_mod.message_from_bytes(raw)
                     emails.append({
                         "uid": _uid_from_meta(meta),
@@ -841,7 +849,7 @@ if MAIL_ENABLED:
                         "from": _decode_header(msg.get("From", "")),
                         "date": msg.get("Date", ""),
                         "body": _extract_body(msg),
-                        "read": False,
+                        "read": "Seen" in flags,
                     })
 
             if not emails:
@@ -1170,6 +1178,7 @@ if __name__ == "__main__":
     # Obtain the Starlette ASGI app from FastMCP so we can attach middleware
     app = mcp.http_app(path="/mcp")
 
+    app.add_middleware(_HealthCheckMiddleware)
     if OAUTH_ENABLED:
         app.add_middleware(_BearerAuthMiddleware)
         log.info("OAuth enabled — /mcp requires Bearer token (client_id=%r)", OAUTH_CLIENT_ID)

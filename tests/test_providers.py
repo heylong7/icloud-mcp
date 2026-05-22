@@ -71,7 +71,7 @@ class TestDeepSeekProvider:
         from event_extractor.providers.deepseek import DeepSeekProvider
         provider = DeepSeekProvider(
             api_key="sk-ds-test",
-            base_url="https://api.deepseek.com",
+            base_url="https://platform.deepseek.com",
             model="deepseek-chat",
         )
         assert provider.api_key == "sk-ds-test"
@@ -82,7 +82,7 @@ class TestDeepSeekProvider:
 
         provider = DeepSeekProvider(
             api_key="sk-ds-test",
-            base_url="https://api.deepseek.com",
+            base_url="https://platform.deepseek.com",
             model="deepseek-chat",
         )
 
@@ -106,7 +106,7 @@ class TestDeepSeekProvider:
 
         provider = DeepSeekProvider(
             api_key="sk-ds-test",
-            base_url="https://api.deepseek.com",
+            base_url="https://platform.deepseek.com",
             model="deepseek-chat",
         )
 
@@ -128,7 +128,7 @@ class TestDeepSeekProvider:
 
         provider = DeepSeekProvider(
             api_key="sk-ds-test",
-            base_url="https://api.deepseek.com",
+            base_url="https://platform.deepseek.com",
             model="deepseek-chat",
         )
 
@@ -146,7 +146,7 @@ class TestDeepSeekProvider:
 
         provider = DeepSeekProvider(
             api_key="sk-ds-test",
-            base_url="https://api.deepseek.com",
+            base_url="https://platform.deepseek.com",
             model="deepseek-chat",
         )
 

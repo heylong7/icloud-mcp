@@ -13,12 +13,12 @@ _PROVIDER_DEFAULTS = {
     "deepseek": {
         "api_key_env": "DEEPSEEK_API_KEY",
         "base_url_default": "https://api.deepseek.com",
-        "model_default": "deepseek-chat",
+        "model_default": "deepseek-v4-flash",
     },
     "openai": {
         "api_key_env": "OPENAI_API_KEY",
         "base_url_default": "https://api.openai.com/v1",
-        "model_default": "gpt-4o",
+        "model_default": "gpt-4o-mini",
     },
 }
 

@@ -114,7 +114,7 @@ def main() -> None:
 
         emails = []
         for uid_b in uids:
-            status, fetch_data = conn.uid("FETCH", uid_b, "(FLAGS RFC822)")
+            status, fetch_data = conn.uid("FETCH", uid_b, "(FLAGS BODY[])")
             if status != "OK":
                 continue
             for item in fetch_data:

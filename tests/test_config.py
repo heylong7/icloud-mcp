@@ -46,13 +46,13 @@ class TestGetProviderConfig:
         env = {
             "LLM_PROVIDER": "deepseek",
             "DEEPSEEK_API_KEY": "sk-test",
-            "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
+            "DEEPSEEK_BASE_URL": "https://platform.deepseek.com",
             "DEEPSEEK_MODEL": "deepseek-chat",
         }
         with patch.dict(os.environ, env, clear=True):
             config = get_provider_config()
             assert config["api_key"] == "sk-test"
-            assert config["base_url"] == "https://api.deepseek.com"
+            assert config["base_url"] == "https://platform.deepseek.com"
             assert config["model"] == "deepseek-chat"
 
     def test_returns_openai_config(self):
@@ -76,7 +76,7 @@ class TestGetProviderConfig:
         with patch.dict(os.environ, env, clear=True):
             config = get_provider_config()
             assert config["api_key"] == "sk-test"
-            assert config["base_url"] == "https://api.deepseek.com"
+            assert config["base_url"] == "https://platform.deepseek.com"
             assert config["model"] == "deepseek-chat"
 
     def test_raises_when_api_key_missing(self):
