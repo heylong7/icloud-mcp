@@ -115,7 +115,7 @@ def main() -> None:
         return m.group(1).decode() if m else "?"
 
     log.info("Connecting to iCloud IMAP...")
-    conn = imaplib.IMAP4_SSL(imap_host, imap_port)
+    conn = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=30)
     try:
         conn.login(apple_id, app_pw)
         conn.select('"INBOX"', readonly=True)

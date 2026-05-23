@@ -35,6 +35,8 @@ I built this to use in Claude Custom Connector, so I can change my iCloud Calend
   - `send_message(to, subject, body, cc?, bcc?)` — send via SMTP
   - `delete_message(uid, mailbox)` — move to Trash
   - `mark_message(uid, mailbox, read)` — mark read/unread
+  - `extract_events_from_emails(mailbox, limit, since_days, auto_create)` — **AI event extraction** (LLM-powered)
+- **Daily automation:** `run_daily.py` — scan recent emails, extract events via LLM, auto-create in calendar
 - ISO datetime input (`YYYY-MM-DDTHH:MM:SS`, with optional `Z` or timezone offset)
 - Minimal ICS generation (summary/description escaping), UID matching across a ±3-year window
 
@@ -72,6 +74,21 @@ IMAP_PORT=993                            # optional, default shown
 SMTP_HOST=smtp.mail.me.com              # optional, default shown
 SMTP_PORT=587                            # optional, default shown
 ICLOUD_TRASH_FOLDER=Deleted Messages     # optional, iCloud trash folder name
+
+# Event extraction (LLM-powered) — required for extract_events_from_emails and run_daily.py
+LLM_PROVIDER=deepseek                    # deepseek or openai
+DEEPSEEK_API_KEY=sk-your-key             # DeepSeek API key
+DEEPSEEK_BASE_URL=https://api.deepseek.com  # optional, default shown
+DEEPSEEK_MODEL=deepseek-v4-flash         # optional, default shown
+# OpenAI alternative:
+# LLM_PROVIDER=openai
+# OPENAI_API_KEY=sk-your-key
+# OPENAI_BASE_URL=https://api.openai.com/v1
+# OPENAI_MODEL=gpt-4o-mini
+
+# Daily scan settings
+SINCE_DAYS=3                             # Days to look back for emails (default 3)
+CALENDAR_NAME=Work                       # Target calendar for auto-created events
 ```
 
 Required: `APPLE_ID`, `ICLOUD_APP_PASSWORD`.
@@ -225,6 +242,72 @@ Copies to Trash (`Deleted Messages` by default, override with `ICLOUD_TRASH_FOLD
 ### `mark_message(uid, mailbox="INBOX", read=True) -> bool`
 
 Sets or clears the `\Seen` flag. Returns `True` on success.
+
+### `extract_events_from_emails(mailbox="INBOX", limit=50, since_days=3, auto_create=True) -> Dict`
+
+AI-powered event extraction from emails. Fetches recent emails via IMAP, sends them to an LLM (DeepSeek or OpenAI) for analysis, and returns structured calendar events.
+
+**Args**
+
+- `mailbox: str` — mailbox to scan (default `"INBOX"`)
+- `limit: int` — max emails to process (default 50)
+- `since_days: int` — only process emails from the last N days (default 3)
+- `auto_create: bool` — if `True`, explicit-time events are auto-created in iCloud Calendar
+
+**Returns**
+
+```jsonc
+{
+    "explicit": [...],           // events with clear dates/times
+    "vague": [...],              // events with implied timing (pending confirmation)
+    "total_emails_scanned": 5,
+    "new_emails_processed": 2,
+    "auto_created": 1            // number of events written to calendar
+}
+```
+
+Each extracted event has: `title`, `start`, `end`, `location`, `description`, `source_email_uid`, `time_clarity` (explicit/vague).
+
+**Event types detected:** meetings, lectures, seminars, workshops, job fairs, paper deadlines, copyright signing, review invitations, flights, hotel bookings, exams, course schedules, assessment deadlines.
+
+**How it works:**
+1. IMAP SINCE search retrieves emails from the last N days (regardless of read status)
+2. SQLite-based deduplication skips previously processed emails
+3. LLM (DeepSeek/OpenAI) extracts time-sensitive events from email content
+4. Failed extractions are retried next run (emails marked processed only on success)
+5. HTML-only emails are converted to plain text before analysis
+
+**Required config:** `LLM_PROVIDER`, `DEEPSEEK_API_KEY` (or `OPENAI_API_KEY`), `CALENDAR_NAME` (optional, for auto-create target).
+
+---
+
+## Daily Automation
+
+`run_daily.py` is a standalone script for unattended periodic execution (e.g., Windows Task Scheduler).
+
+```powershell
+# Run manually
+python run_daily.py
+
+# Schedule every 4 hours via Windows Task Scheduler
+schtasks /Create /SC DAILY /TN "MailEventExtract" `
+  /TR "C:\path\to\python.exe C:\path\to\run_daily.py" /ST 08:00
+```
+
+The script:
+- Connects directly to iCloud IMAP (no MCP server needed)
+- Searches emails from the last `SINCE_DAYS` days
+- Processes newest 50, skips already-processed via SQLite dedup
+- Extracts events via the same LLM pipeline as the MCP tool
+- Auto-creates explicit events in the `CALENDAR_NAME` calendar
+- Logs to `run_daily.log` in the project root
+
+**Schedule settings for reliability:**
+- `WakeToRun` — wakes computer from sleep
+- `StartWhenAvailable` — runs missed tasks on next boot
+- `MultipleInstancesPolicy=IgnoreNew` — skips if previous run still active
+
+See `MailEventExtract.xml` section above for full Task Scheduler XML config.
 
 ---
 

@@ -475,7 +475,7 @@ def _build_rrule(
 
 def _imap() -> imaplib.IMAP4_SSL:
     """Return a new authenticated IMAP connection (stateless — one per call)."""
-    conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+    conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=30)
     conn.login(APPLE_ID, APP_PW)
     return conn
 
@@ -791,7 +791,7 @@ if MAIL_ENABLED:
         mailbox: str = "INBOX",
         limit: int = 50,
         since_days: int = 3,
-        auto_create: bool = False,
+        auto_create: bool = True,
     ) -> Dict[str, Any]:
         """
         Fetch unread emails and extract time-sensitive events via LLM.

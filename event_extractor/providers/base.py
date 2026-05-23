@@ -37,7 +37,7 @@ class BaseLLMProvider(ABC):
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=120)
 
     @abstractmethod
     def extract_events(self, emails: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
