@@ -209,7 +209,15 @@ def run_extraction_pipeline(
         log.info("No new emails to process (all already extracted)")
         return [], []
 
-    events = provider.extract_events(new_emails)
+    try:
+        events = provider.extract_events(new_emails)
+    except Exception:
+        log.exception("LLM extraction failed, %d emails will be retried next run", len(new_emails))
+        return [], []
+
+    for email in new_emails:
+        dedup.mark_processed(email.get("uid", ""))
+
     explicit, vague = classify_events(events)
 
     if auto_create:
@@ -249,7 +257,21 @@ def extract_and_sync(
             "auto_created": 0,
         }
 
-    events = provider.extract_events(new_emails)
+    try:
+        events = provider.extract_events(new_emails)
+    except Exception:
+        log.exception("LLM extraction failed, %d emails will be retried next run", len(new_emails))
+        return {
+            "explicit": [],
+            "vague": [],
+            "total_emails_scanned": len(emails),
+            "new_emails_processed": 0,
+            "auto_created": 0,
+        }
+
+    for email in new_emails:
+        dedup.mark_processed(email.get("uid", ""))
+
     explicit, vague = classify_events(events)
 
     auto_created = 0

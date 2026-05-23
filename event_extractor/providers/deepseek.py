@@ -18,20 +18,16 @@ class DeepSeekProvider(BaseLLMProvider):
             return []
 
         prompt = self._build_prompt(emails)
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.1,
-            )
-            content = response.choices[0].message.content or ""
-            return _parse_json_response(content)
-        except Exception as exc:
-            log.error("DeepSeek API call failed: %s", exc)
-            return []
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+        )
+        content = response.choices[0].message.content or ""
+        return _parse_json_response(content)
 
 
 def _parse_json_response(content: str) -> List[Dict[str, Any]]:

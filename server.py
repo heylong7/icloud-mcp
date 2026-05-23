@@ -860,10 +860,12 @@ if MAIL_ENABLED:
 
             config = get_provider_config()
             provider = get_provider(config)
+            calendar_name = os.environ.get("CALENDAR_NAME", "Calendar")
             result = extract_and_sync(
                 provider=provider,
                 emails=emails,
                 auto_create=auto_create,
+                calendar_name=calendar_name,
                 dedup_db_path=str(Path(__file__).parent / "event_extractor.db"),
             )
             return result

@@ -5,12 +5,14 @@ Usage:
     python run_daily.py
 
 Intended to be scheduled via Windows Task Scheduler to run daily at 8:00 AM.
-Fetches unread emails from the last 1 day, extracts explicit-time events,
-and auto-creates them in iCloud Calendar. Vague events are logged for review.
+Fetches emails from the last N days (configurable via SINCE_DAYS env var, default 3),
+extracts explicit-time events, and auto-creates them in iCloud Calendar.
+Vague events are logged for review.
 """
 
 import logging
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # Ensure the project root is on sys.path
@@ -58,6 +60,8 @@ def main() -> None:
     app_pw = os.environ.get("ICLOUD_APP_PASSWORD", "")
     imap_host = os.environ.get("IMAP_HOST", "imap.mail.me.com")
     imap_port = int(os.environ.get("IMAP_PORT", "993"))
+    since_days = int(os.environ.get("SINCE_DAYS", "3"))
+    calendar_name = os.environ.get("CALENDAR_NAME", "Calendar")
 
     if not apple_id or not app_pw:
         log.error("Missing iCloud credentials. Set APPLE_ID and ICLOUD_APP_PASSWORD in .env")
@@ -76,6 +80,7 @@ def main() -> None:
     def extract_body(msg: _email_mod.message.Message) -> str:
         if msg.is_multipart():
             plain = None
+            html = None
             for part in msg.walk():
                 ct = part.get_content_type()
                 cd = str(part.get("Content-Disposition", ""))
@@ -86,8 +91,15 @@ def main() -> None:
                     payload = part.get_payload(decode=True)
                     if payload:
                         plain = payload.decode(charset, errors="replace")
+                elif ct == "text/html" and html is None:
+                    charset = part.get_content_charset() or "utf-8"
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        html = payload.decode(charset, errors="replace")
             if plain is not None:
                 return plain
+            if html is not None:
+                return re.sub(r"<[^>]+>", "", html)
             return ""
         else:
             charset = msg.get_content_charset() or "utf-8"
@@ -104,13 +116,15 @@ def main() -> None:
         conn.login(apple_id, app_pw)
         conn.select('"INBOX"', readonly=True)
 
-        status, data = conn.uid("SEARCH", None, "UNSEEN")
+        since_date = (datetime.now() - timedelta(days=since_days)).strftime("%d-%b-%Y")
+        status, data = conn.uid("SEARCH", None, f"SINCE {since_date}")
         if status != "OK" or not data or not data[0]:
-            log.info("No unread emails found")
+            log.info("No emails found since %d day(s) ago", since_days)
             return
 
-        uids = data[0].split()[-50:][::-1]  # newest 50 first
-        log.info("Found %d unread emails", len(uids))
+        uids = data[0].split()
+        uids = uids[-50:][::-1]  # newest 50 first
+        log.info("Found %d emails since %d day(s) ago, processing newest 50", len(uids), since_days)
 
         emails = []
         for uid_b in uids:
@@ -134,13 +148,14 @@ def main() -> None:
                 })
 
         if not emails:
-            log.info("No unread emails to process")
+            log.info("No emails to process")
             return
 
         result = extract_and_sync(
             provider=provider,
             emails=emails,
             auto_create=True,
+            calendar_name=calendar_name,
             dedup_db_path=str(Path(__file__).parent / "event_extractor.db"),
         )
 

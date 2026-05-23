@@ -47,12 +47,11 @@ class EmailDedup:
     def filter_unprocessed(self, emails: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Filter a list of email dicts, returning only unprocessed ones.
 
-        Also marks the returned emails as processed.
+        Does NOT mark as processed — call mark_processed after successful extraction.
         """
         unprocessed = []
         for email in emails:
             uid = email.get("uid", "")
             if uid and not self.is_processed(uid):
                 unprocessed.append(email)
-                self.mark_processed(uid)
         return unprocessed
