@@ -115,11 +115,16 @@ def main() -> None:
         return m.group(1).decode() if m else "?"
 
     log.info("Connecting to iCloud IMAP...")
-    conn = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=30)
+    conn = None
     try:
+        conn = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=30)
         conn.login(apple_id, app_pw)
         conn.select('"INBOX"', readonly=True)
+    except Exception:
+        log.exception("Failed to connect to iCloud IMAP, skipping this run")
+        return
 
+    try:
         _months = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
                    7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
         cutoff = datetime.now() - timedelta(days=since_days)

@@ -23,8 +23,10 @@ Output ONLY a JSON array. Each event:
 }
 
 Rules:
-- If NO clear time is mentioned, DO NOT extract — skip the event entirely
-- time_clarity: "explicit" when a specific date + time is given; "vague" when timing is only implied
+- If an email contains NO event-related content at all, skip it (no entry in the array)
+- time_clarity: "explicit" when a specific date + time is given (e.g. "June 15 at 2pm", "2026-06-15 14:00")
+- time_clarity: "vague" when an event is mentioned but timing is fuzzy or relative (e.g. "next Monday", "this weekend", "tomorrow morning", "next month deadline", "ASAP")
+- BOTH explicit AND vague events MUST be extracted — only skip emails with zero event content
 - If end time is missing, use start + 1 hour
 - For deadline dates (e.g. "by June 15"), set end to 23:59 on that date, start to 22:59
 - Output ONLY valid JSON array, no markdown, no extra text"""
