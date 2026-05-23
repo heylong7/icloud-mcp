@@ -76,8 +76,8 @@ class TestGetProviderConfig:
         with patch.dict(os.environ, env, clear=True):
             config = get_provider_config()
             assert config["api_key"] == "sk-test"
-            assert config["base_url"] == "https://platform.deepseek.com"
-            assert config["model"] == "deepseek-chat"
+            assert config["base_url"] == "https://api.deepseek.com"
+            assert config["model"] == "deepseek-v4-flash"
 
     def test_raises_when_api_key_missing(self):
         env = {"LLM_PROVIDER": "deepseek"}

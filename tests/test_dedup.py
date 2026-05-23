@@ -35,13 +35,13 @@ class TestEmailDedup:
         assert "uid-002" in uids
         assert "uid-003" in uids
 
-    def test_filter_unprocessed_marks_as_processed(self, temp_db_path):
+    def test_filter_unprocessed_does_not_mark(self, temp_db_path):
         dedup = EmailDedup(db_path=temp_db_path)
         emails = [{"uid": "uid-001"}, {"uid": "uid-002"}]
         result = dedup.filter_unprocessed(emails)
         assert len(result) == 2
-        assert dedup.is_processed("uid-001")
-        assert dedup.is_processed("uid-002")
+        assert not dedup.is_processed("uid-001")
+        assert not dedup.is_processed("uid-002")
 
     def test_creates_table_on_init(self, temp_db_path):
         dedup = EmailDedup(db_path=temp_db_path)

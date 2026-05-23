@@ -60,7 +60,11 @@ def main() -> None:
     app_pw = os.environ.get("ICLOUD_APP_PASSWORD", "")
     imap_host = os.environ.get("IMAP_HOST", "imap.mail.me.com")
     imap_port = int(os.environ.get("IMAP_PORT", "993"))
-    since_days = int(os.environ.get("SINCE_DAYS", "3"))
+    try:
+        since_days = int(os.environ.get("SINCE_DAYS", "3"))
+    except (ValueError, TypeError):
+        log.warning("Invalid SINCE_DAYS value, defaulting to 3")
+        since_days = 3
     calendar_name = os.environ.get("CALENDAR_NAME", "Calendar")
 
     if not apple_id or not app_pw:
@@ -116,7 +120,10 @@ def main() -> None:
         conn.login(apple_id, app_pw)
         conn.select('"INBOX"', readonly=True)
 
-        since_date = (datetime.now() - timedelta(days=since_days)).strftime("%d-%b-%Y")
+        _months = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+                   7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
+        cutoff = datetime.now() - timedelta(days=since_days)
+        since_date = cutoff.strftime(f"%d-{_months[cutoff.month]}-%Y")
         status, data = conn.uid("SEARCH", None, f"SINCE {since_date}")
         if status != "OK" or not data or not data[0]:
             log.info("No emails found since %d day(s) ago", since_days)

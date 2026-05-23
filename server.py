@@ -814,7 +814,10 @@ if MAIL_ENABLED:
         conn = _imap()
         try:
             conn.select(f'"{mailbox}"', readonly=True)
-            since_date = (dt.datetime.now() - dt.timedelta(days=since_days)).strftime("%d-%b-%Y")
+            _months = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+                       7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
+            cutoff = dt.datetime.now() - dt.timedelta(days=since_days)
+            since_date = cutoff.strftime(f"%d-{_months[cutoff.month]}-%Y")
             status, data = conn.uid("SEARCH", None, f"SINCE {since_date}")
             if status != "OK" or not data or not data[0]:
                 return {
